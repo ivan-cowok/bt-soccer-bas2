@@ -523,7 +523,7 @@ def create_solution(
         zip_output_file_name=solution_archive_file_base_name,
     )
 
-
+"""
 if __name__ == "__main__":
     # Launch modes:
     #   Single GPU:  uv run python dudek/scripts/tdeed.py
@@ -539,3 +539,4 @@ if __name__ == "__main__":
         overlap=55,
         nr_epochs=25
     )
+"""
