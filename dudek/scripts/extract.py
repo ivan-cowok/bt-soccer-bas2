@@ -4,6 +4,8 @@ from dudek.utils.video import load_bas_videos, load_action_spotting_videos
 
 import click
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+
 cli = click.Group()
 
 
