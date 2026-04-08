@@ -1,3 +1,5 @@
+import os
+
 import torch
 import wandb
 from tqdm import tqdm
@@ -433,10 +435,11 @@ def train_challenge(
         start_eval_epoch_nr=0,
     )
 
-    torch.save(
-        model.state_dict(),
-        save_as,
-    )
+    if int(os.environ.get("LOCAL_RANK", -1)) in (-1, 0):
+        torch.save(
+            model.state_dict(),
+            save_as,
+        )
 
 
 

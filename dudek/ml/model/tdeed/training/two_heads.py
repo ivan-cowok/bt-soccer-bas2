@@ -6,6 +6,8 @@ import time
 from typing import Type, Optional
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from contextlib import nullcontext
 
 from torch.optim.lr_scheduler import (
@@ -58,51 +60,51 @@ def train(
 ):
 
     assert eval_metric in ["loss", "map"], "eval_metric must be loss or map"
+
+    # DDP setup: torchrun sets LOCAL_RANK; plain python leaves it unset (-1).
+    _local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    _is_ddp = _local_rank >= 0
+
+    if _is_ddp:
+        if not dist.is_initialized():
+            dist.init_process_group(backend="nccl")
+        device = f"cuda:{_local_rank}"
+        torch.cuda.set_device(_local_rank)
+
+    _is_main = (not _is_ddp) or dist.get_rank() == 0
+
     model.to(device)
+
+    if _is_ddp:
+        model = DDP(model, device_ids=[_local_rank], output_device=_local_rank)
+        if _is_main:
+            print(f"[DDP] {dist.get_world_size()} GPUs active")
+    elif torch.cuda.device_count() > 1:
+        print(
+            f"NOTE: {torch.cuda.device_count()} GPUs available but only 1 in use.\n"
+            "Run with:  torchrun --nproc_per_node=2 dudek/scripts/tdeed.py"
+        )
+
+    raw_model = model.module if isinstance(model, DDP) else model
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler("cuda") if "cuda" in device else None
 
-    hparam_dict = {
-        "eval_metric": eval_metric,
-        "foreground_weight": foreground_weight,
-        "train_batch_size": train_batch_size,
-        "val_batch_size": val_batch_size,
-        "acc_grad_iter": acc_grad_iter,
-        "start_eval_epoch_nr": start_eval_epoch_nr,
-        "nr_epochs": nr_epochs,
-        "displacement": train_dataset.displacement,
-        "clip_length": len(train_dataset.clips[0].frames),
-        "epoch_volume": len(train_dataset.clips),
-        "horizontal_flip_proba": train_dataset.flip_proba,
-        "crop_proba": train_dataset.crop_proba,
-        "features_model_name": model.features_model_name,
-        "temporal_shift_mode": model.temporal_shift_mode,
-        "sgp_ks": model.sgp_ks,
-        "sgp_k": model.sgp_k,
-        "n_layers": model.n_layers,
-        "camera_move_proba": train_dataset.camera_move_proba,
-        "learning_rate": optimizer.param_groups[0]["lr"],
-        "optimizer": optimizer.__class__.__name__,
-        "model": model.__class__.__name__,
-        "train_dataset": train_dataset.__class__.__name__,
-        "val_dataset": (
-            val_dataset.__class__.__name__ if val_dataset is not None else None
-        ),
-        "device": device,
-    }
-
-    summary_writer = SummaryWriter(log_dir=f"runs/{experiment_name}_{time.time()}")
-    summary_writer.add_text(
-        "train/hyperparameters", json.dumps(hparam_dict, indent=4), global_step=0
-    )
+    if _is_ddp:
+        train_sampler = torch.utils.data.DistributedSampler(train_dataset, shuffle=True)
+    else:
+        train_sampler = None
 
     train_data_loader = DataLoader(
-        train_dataset, batch_size=train_batch_size, shuffle=True
+        train_dataset,
+        batch_size=train_batch_size,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
     )
     if val_dataset is not None:
         eval_data_loader = DataLoader(
             val_dataset, batch_size=val_batch_size, shuffle=True
         )
+
     optimizer_steps_per_epoch = len(train_data_loader) // acc_grad_iter
 
     scheduler = get_lr_scheduler_with_warmup(
@@ -120,7 +122,46 @@ def train(
             delta_frames_tolerance=5,
         )
 
+    if _is_main:
+        hparam_dict = {
+            "eval_metric": eval_metric,
+            "foreground_weight": foreground_weight,
+            "train_batch_size": train_batch_size,
+            "val_batch_size": val_batch_size,
+            "acc_grad_iter": acc_grad_iter,
+            "start_eval_epoch_nr": start_eval_epoch_nr,
+            "nr_epochs": nr_epochs,
+            "displacement": train_dataset.displacement,
+            "clip_length": len(train_dataset.clips[0].frames),
+            "epoch_volume": len(train_dataset.clips),
+            "horizontal_flip_proba": train_dataset.flip_proba,
+            "crop_proba": train_dataset.crop_proba,
+            "features_model_name": raw_model.features_model_name,
+            "temporal_shift_mode": raw_model.temporal_shift_mode,
+            "sgp_ks": raw_model.sgp_ks,
+            "sgp_k": raw_model.sgp_k,
+            "n_layers": raw_model.n_layers,
+            "camera_move_proba": train_dataset.camera_move_proba,
+            "learning_rate": optimizer.param_groups[0]["lr"],
+            "optimizer": optimizer.__class__.__name__,
+            "model": raw_model.__class__.__name__,
+            "train_dataset": train_dataset.__class__.__name__,
+            "val_dataset": (
+                val_dataset.__class__.__name__ if val_dataset is not None else None
+            ),
+            "device": device,
+        }
+        summary_writer = SummaryWriter(log_dir=f"runs/{experiment_name}_{time.time()}")
+        summary_writer.add_text(
+            "train/hyperparameters", json.dumps(hparam_dict, indent=4), global_step=0
+        )
+    else:
+        summary_writer = None
+
     for epoch_nr in range(nr_epochs):
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch_nr)
+
         _go_through_epoch_train(
             model=model,
             labels_enum=labels_enum,
@@ -134,9 +175,10 @@ def train(
             foreground_weight=foreground_weight,
             epoch_nr=epoch_nr,
             loss_weights=loss_weights or [1.5, 1],
+            is_main=_is_main,
         )
 
-        if val_dataset is not None:
+        if _is_main and val_dataset is not None:
             if epoch_nr >= start_eval_epoch_nr:
                 model.eval()
                 if eval_metric == "loss":
@@ -150,10 +192,7 @@ def train(
                     if eval_loss.total_loss < best_eval_metric:
                         best_eval_metric = eval_loss.total_loss
                         if save_as:
-                            torch.save(
-                                model.state_dict(),
-                                save_as,
-                            )
+                            torch.save(raw_model.state_dict(), save_as)
 
                     summary_writer.add_scalar(
                         "eval/total_loss", eval_loss.total_loss, epoch_nr
@@ -173,10 +212,7 @@ def train(
                     if map_mine > best_eval_metric:
                         best_eval_metric = map_mine
                         if save_as:
-                            torch.save(
-                                model.state_dict(),
-                                save_as,
-                            )
+                            torch.save(raw_model.state_dict(), save_as)
 
                     summary_writer.add_scalar(
                         "eval/map_mine",
@@ -192,7 +228,7 @@ def train(
                         )
 
                 model.train()
-    return model
+    return raw_model
 
 
 def _get_eval_loss(
@@ -224,7 +260,7 @@ def _go_through_epoch_train(
     labels_enum: Type[BASLabel | ActionLabel],
     data_loader: DataLoader[TeamTDeedDataset],
     scheduler: LRScheduler = None,
-    scaler: torch.cuda.amp.GradScaler = None,
+    scaler: torch.amp.GradScaler = None,
     optimizer: torch.optim.Optimizer = None,
     acc_grad_iter: int = None,
     epoch_nr: int = None,
@@ -232,6 +268,7 @@ def _go_through_epoch_train(
     device=DEFAULT_DEVICE,
     summary_writer: SummaryWriter = None,
     loss_weights=None,
+    is_main: bool = True,
 ):
     return _go_through_epoch(
         model=model,
@@ -247,6 +284,7 @@ def _go_through_epoch_train(
         device=device,
         summary_writer=summary_writer,
         loss_weights=loss_weights or [1.5, 1],
+        is_main=is_main,
     )
 
 
@@ -276,7 +314,7 @@ def _go_through_epoch(
     data_loader: DataLoader[TeamTDeedDataset],
     evaluate: bool = False,
     scheduler: LRScheduler = None,
-    scaler: torch.cuda.amp.GradScaler = None,
+    scaler: torch.amp.GradScaler = None,
     optimizer: torch.optim.Optimizer = None,
     acc_grad_iter: int = None,
     epoch_nr: int = None,
@@ -284,6 +322,7 @@ def _go_through_epoch(
     device=DEFAULT_DEVICE,
     summary_writer: SummaryWriter = None,
     loss_weights=None,
+    is_main: bool = True,
 ):
     loss_weights = loss_weights or [1.5, 1]
     if not evaluate:
@@ -298,11 +337,13 @@ def _go_through_epoch(
 
     batch_idx = 0
     with torch.no_grad() if evaluate else nullcontext():
-        for batch in tqdm(data_loader, total=len(data_loader)):
+        for batch in tqdm(data_loader, total=len(data_loader), disable=not is_main):
 
-            clip_tensor = batch["clip_tensor"]
-            label = batch["labels_vector"]
-            labels_displacement_vector = batch["labels_displacement_vector"]
+            clip_tensor = batch["clip_tensor"].to(device, non_blocking=True)
+            label = batch["labels_vector"].to(device, non_blocking=True)
+            labels_displacement_vector = batch["labels_displacement_vector"].to(
+                device, non_blocking=True
+            )
 
             label = (
                 label.flatten()
@@ -338,7 +379,7 @@ def _go_through_epoch(
                 loss += loss_d * loss_weights[1]
 
             if not evaluate:
-                if summary_writer:
+                if is_main and summary_writer:
                     summary_writer.add_scalar(
                         "train/loss",
                         loss.detach().item(),
@@ -349,7 +390,7 @@ def _go_through_epoch(
                         optimizer.param_groups[0]["lr"],
                         epoch_nr * len(data_loader) + batch_idx,
                     )
-                else:
+                elif is_main:
                     print("train/loss", loss.detach().item())
             if not evaluate:
                 _optim_step(
