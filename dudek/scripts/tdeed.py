@@ -117,8 +117,8 @@ def pretrain(
     )
 
     train_dataset, val_dataset = all_dataset.split_by_matches(
-        #counts=[460, 40], random_seed=random_seed
-        counts=[3, 1], random_seed=random_seed
+        counts=[460, 40], random_seed=random_seed
+        #counts=[3, 1], random_seed=random_seed
     )
 
     if enforce_train_epoch_size is not None:
