@@ -273,9 +273,11 @@ class TeamTDeedDataset(Dataset):
     def split_by_matches(
         self, counts: List[int], random_seed: int = 42
     ) -> List["TeamTDeedDataset"]:
-        assert sum(counts) == len(
-            self.get_unique_matches()
-        ), f"Make sure your proportion sums up to {len(self.get_unique_matches())}"
+        n_unique = len(self.get_unique_matches())
+        assert sum(counts) == n_unique, (
+            f"counts sum to {sum(counts)} but dataset has {n_unique} unique matches. "
+            f"Adjust counts or use the auto-split in the pretrain/train script."
+        )
         random.seed(random_seed)
         unique_matches = sorted(list(self.get_unique_matches()))
         random.shuffle(unique_matches)

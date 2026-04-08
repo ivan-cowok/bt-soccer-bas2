@@ -116,9 +116,13 @@ def pretrain(
         even_choice_proba=even_choice_proba,
     )
 
+    n_matches = len(all_dataset.get_unique_matches())
+    assert n_matches >= 2, f"Need at least 2 unique matches, got {n_matches}"
+    n_val = max(1, round(n_matches * 0.08))   # ~8 % for validation, at least 1
+    n_train = n_matches - n_val
+    print(f"Splitting {n_matches} matches → train={n_train}, val={n_val}")
     train_dataset, val_dataset = all_dataset.split_by_matches(
-        counts=[460, 40], random_seed=random_seed
-        #counts=[3, 1], random_seed=random_seed
+        counts=[n_train, n_val], random_seed=random_seed
     )
 
     if enforce_train_epoch_size is not None:
