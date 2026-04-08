@@ -530,20 +530,10 @@ def create_solution(
         zip_output_file_name=solution_archive_file_base_name,
     )
 
-"""
+
 if __name__ == "__main__":
-    # Launch modes:
-    #   Single GPU:  uv run python dudek/scripts/tdeed.py
-    #   Multi-GPU:   uv run torchrun --nproc_per_node=2 dudek/scripts/tdeed.py
-    #
-    # Stage 1: pretrain on Action Spotting data
-    pretrain.callback(
-        dataset_path="E:/Database/44/soccernet_action_spotting",
-        resolution=720,
-        save_as = "pretrained.pt",
-        clip_frames_count=80,
-        enforce_train_epoch_size = 6000,
-        overlap=55,
-        nr_epochs=25
-    )
-"""
+    # Single GPU:  uv run python dudek/scripts/tdeed.py pretrain ...
+    # Multi-GPU:   uv run torchrun --nproc_per_node=N dudek/scripts/tdeed.py pretrain ...
+    # With python -c, do not put "--" before the subcommand (Click exits 2). Example:
+    #   python -c "from dudek.scripts.tdeed import cli; cli()" pretrain --dataset_path=...
+    cli()
