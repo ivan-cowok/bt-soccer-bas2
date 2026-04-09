@@ -66,10 +66,18 @@ def train(
     _is_ddp = _local_rank >= 0
 
     if _is_ddp:
+        # Bind this process to its GPU before NCCL init and before any CUDA tensors.
+        # (init_process_group first + default cuda:0 usage is a common source of
+        # ncclUnhandledCudaError / invalid argument on multi-GPU.)
+        device = f"cuda:{_local_rank}"
+        if _local_rank >= torch.cuda.device_count():
+            raise RuntimeError(
+                f"LOCAL_RANK={_local_rank} but only {torch.cuda.device_count()} CUDA device(s) "
+                "visible — use --nproc_per_node <= GPU count and check CUDA_VISIBLE_DEVICES."
+            )
+        torch.cuda.set_device(_local_rank)
         if not dist.is_initialized():
             dist.init_process_group(backend="nccl")
-        device = f"cuda:{_local_rank}"
-        torch.cuda.set_device(_local_rank)
 
     _is_main = (not _is_ddp) or dist.get_rank() == 0
 
