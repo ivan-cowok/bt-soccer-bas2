@@ -534,6 +534,36 @@ def create_solution(
 if __name__ == "__main__":
     # Single GPU:  uv run python dudek/scripts/tdeed.py pretrain ...
     # Multi-GPU:   uv run torchrun --nproc_per_node=N dudek/scripts/tdeed.py pretrain ...
-    # With python -c, do not put "--" before the subcommand (Click exits 2). Example:
-    #   python -c "from dudek.scripts.tdeed import cli; cli()" pretrain --dataset_path=...
-    cli()
+    import traceback
+
+    _rank = int(os.environ.get("RANK", 0))
+    _log_dir = os.environ.get("TRAIN_LOG_DIR", "logs")
+    os.makedirs(_log_dir, exist_ok=True)
+    _log_path = os.path.join(_log_dir, f"rank_{_rank}.log")
+
+    class _Tee:
+        def __init__(self, stream, path):
+            self._stream = stream
+            self._file = open(path, "w", buffering=1)
+
+        def write(self, data):
+            self._stream.write(data)
+            self._file.write(data)
+
+        def flush(self):
+            self._stream.flush()
+            self._file.flush()
+
+        def __getattr__(self, attr):
+            return getattr(self._stream, attr)
+
+    import sys
+    sys.stdout = _Tee(sys.stdout, _log_path)
+    sys.stderr = _Tee(sys.stderr, _log_path)
+
+    try:
+        cli()
+    except Exception:
+        traceback.print_exc()
+        sys.stdout.flush()
+        raise
