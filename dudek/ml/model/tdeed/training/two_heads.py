@@ -67,35 +67,40 @@ def train(
 
     if _is_ddp:
         # Bind this process to its GPU before NCCL init and before any CUDA tensors.
-        # (init_process_group first + default cuda:0 usage is a common source of
-        # ncclUnhandledCudaError / invalid argument on multi-GPU.)
-        device = f"cuda:{_local_rank}"
         if _local_rank >= torch.cuda.device_count():
             raise RuntimeError(
                 f"LOCAL_RANK={_local_rank} but only {torch.cuda.device_count()} CUDA device(s) "
                 "visible — use --nproc_per_node <= GPU count and check CUDA_VISIBLE_DEVICES."
             )
-        torch.cuda.set_device(_local_rank)
+        device = torch.device("cuda", _local_rank)
+        torch.cuda.set_device(device)
         if not dist.is_initialized():
             dist.init_process_group(backend="nccl")
 
     _is_main = (not _is_ddp) or dist.get_rank() == 0
 
-    model.to(device)
-
     if _is_ddp:
-        model = DDP(model, device_ids=[_local_rank], output_device=_local_rank)
+        # Keep .to() and DDP on the same current device context (avoids NCCL errors
+        # during _verify_param_shape_across_processes on some drivers / containers).
+        with torch.cuda.device(device):
+            model.to(device)
+            model = DDP(model)
         if _is_main:
             print(f"[DDP] {dist.get_world_size()} GPUs active")
-    elif torch.cuda.device_count() > 1:
-        print(
-            f"NOTE: {torch.cuda.device_count()} GPUs available but only 1 in use.\n"
-            "Run with:  torchrun --nproc_per_node=2 dudek/scripts/tdeed.py"
-        )
+    else:
+        model.to(device)
+        if torch.cuda.device_count() > 1:
+            print(
+                f"NOTE: {torch.cuda.device_count()} GPUs available but only 1 in use.\n"
+                "Run with:  torchrun --nproc_per_node=2 dudek/scripts/tdeed.py"
+            )
 
     raw_model = model.module if isinstance(model, DDP) else model
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    scaler = torch.amp.GradScaler("cuda") if "cuda" in device else None
+    _on_cuda = (isinstance(device, torch.device) and device.type == "cuda") or (
+        isinstance(device, str) and "cuda" in device
+    )
+    scaler = torch.amp.GradScaler("cuda") if _on_cuda else None
 
     if _is_ddp:
         train_sampler = torch.utils.data.DistributedSampler(train_dataset, shuffle=True)
@@ -157,7 +162,7 @@ def train(
             "val_dataset": (
                 val_dataset.__class__.__name__ if val_dataset is not None else None
             ),
-            "device": device,
+            "device": str(device),
         }
         summary_writer = SummaryWriter(log_dir=f"runs/{experiment_name}_{time.time()}")
         summary_writer.add_text(
@@ -343,6 +348,12 @@ def _go_through_epoch(
         [1] + [foreground_weight for _ in labels_enum]
     ).to(device)
 
+    _amp_device_type = (
+        device.type
+        if isinstance(device, torch.device)
+        else str(device).split(":")[0]
+    )
+
     batch_idx = 0
     with torch.no_grad() if evaluate else nullcontext():
         for batch in tqdm(data_loader, total=len(data_loader), disable=not is_main):
@@ -359,7 +370,7 @@ def _go_through_epoch(
                 else label.view(-1, label.shape[-1])
             )
 
-            with torch.amp.autocast(device):
+            with torch.amp.autocast(device_type=_amp_device_type):
                 pred_dict, y = model(clip_tensor, y=label, inference=evaluate)
 
                 pred = pred_dict["im_feat"]

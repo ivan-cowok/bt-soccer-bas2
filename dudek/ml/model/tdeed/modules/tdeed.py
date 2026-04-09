@@ -146,7 +146,9 @@ class TDeedModule(nn.Module):
         return x
 
     def load_backbone(self, model_weight_path: str):
-        m = torch.load(model_weight_path, weights_only=True)
+        m = torch.load(
+            model_weight_path, map_location=torch.device("cpu"), weights_only=True
+        )
         _features_layers = OrderedDict(
             {
                 k[len("_features.") :]: v
@@ -165,5 +167,7 @@ class TDeedModule(nn.Module):
         self._temp_fine.load_state_dict(_temp_fine_layers)
 
     def load_all(self, model_weight_path: str):
-        m = torch.load(model_weight_path, weights_only=True)
+        m = torch.load(
+            model_weight_path, map_location=torch.device("cpu"), weights_only=True
+        )
         self.load_state_dict(m)
