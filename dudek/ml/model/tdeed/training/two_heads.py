@@ -66,41 +66,28 @@ def train(
     _is_ddp = _local_rank >= 0
 
     if _is_ddp:
-        # Bind this process to its GPU before NCCL init and before any CUDA tensors.
-        if _local_rank >= torch.cuda.device_count():
-            raise RuntimeError(
-                f"LOCAL_RANK={_local_rank} but only {torch.cuda.device_count()} CUDA device(s) "
-                "visible — use --nproc_per_node <= GPU count and check CUDA_VISIBLE_DEVICES."
-            )
-        device = torch.device("cuda", _local_rank)
-        torch.cuda.set_device(device)
         if not dist.is_initialized():
             dist.init_process_group(backend="nccl")
+        device = f"cuda:{_local_rank}"
+        torch.cuda.set_device(_local_rank)
 
     _is_main = (not _is_ddp) or dist.get_rank() == 0
 
+    model.to(device)
+
     if _is_ddp:
-        # Keep .to() and DDP on the same current device context (avoids NCCL errors
-        # during _verify_param_shape_across_processes on some drivers / containers).
-        with torch.cuda.device(device):
-            model.to(device)
-            model = DDP(model)
+        model = DDP(model, device_ids=[_local_rank], output_device=_local_rank)
         if _is_main:
             print(f"[DDP] {dist.get_world_size()} GPUs active")
-    else:
-        model.to(device)
-        if torch.cuda.device_count() > 1:
-            print(
-                f"NOTE: {torch.cuda.device_count()} GPUs available but only 1 in use.\n"
-                "Run with:  torchrun --nproc_per_node=2 dudek/scripts/tdeed.py"
-            )
+    elif torch.cuda.device_count() > 1:
+        print(
+            f"NOTE: {torch.cuda.device_count()} GPUs available but only 1 in use.\n"
+            "Run with:  torchrun --nproc_per_node=2 dudek/scripts/tdeed.py"
+        )
 
     raw_model = model.module if isinstance(model, DDP) else model
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
-    _on_cuda = (isinstance(device, torch.device) and device.type == "cuda") or (
-        isinstance(device, str) and "cuda" in device
-    )
-    scaler = torch.amp.GradScaler("cuda") if _on_cuda else None
+    scaler = torch.amp.GradScaler("cuda") if "cuda" in device else None
 
     if _is_ddp:
         train_sampler = torch.utils.data.DistributedSampler(train_dataset, shuffle=True)
@@ -348,11 +335,7 @@ def _go_through_epoch(
         [1] + [foreground_weight for _ in labels_enum]
     ).to(device)
 
-    _amp_device_type = (
-        device.type
-        if isinstance(device, torch.device)
-        else str(device).split(":")[0]
-    )
+    _amp_device_type = device.split(":")[0]
 
     batch_idx = 0
     with torch.no_grad() if evaluate else nullcontext():
