@@ -80,6 +80,8 @@ class _TeamBASScoredVideo(TeamBASScoredVideo):
         fps = self.video.actual_fps if use_true_fps else self.video.metadata_fps
         for i, x in enumerate(self.scores):
             confidence = np.max(x)
+            if confidence <= 0.0:
+                continue
             label_idx = np.argmax(x)
             label = int2labels_map.get(label_idx + 1)
             if label is None:

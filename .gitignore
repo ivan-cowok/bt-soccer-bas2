@@ -1,6 +1,6 @@
 .DS_Store
 twistd.pid
-
+solution
 *.pt
 *.zip
 # Byte-compiled / optimized / DLL files
