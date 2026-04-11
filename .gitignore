@@ -1,8 +1,8 @@
 .DS_Store
 twistd.pid
 solution
-*.pt
 *.zip
+*.pt
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
