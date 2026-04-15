@@ -113,7 +113,6 @@ class TdeedVideoClip:
             imgs,
             dim=0,
         )
-        clip_tensor = clip_tensor.to(device)
 
         if random.random() < camera_movement_proba:
             clip_tensor = augment_with_camera_movement(clip_tensor)
@@ -132,9 +131,9 @@ class TdeedVideoClip:
 
         return cls(
             contains_event=video_clip.has_events,
-            labels_vector=labels_vector.to(device),
+            labels_vector=labels_vector,
             labels_displacement_vector=(
-                torch.Tensor(labels_displacement_vector).to(device).float()
+                torch.Tensor(labels_displacement_vector).float()
                 if labels_displacement
                 else None
             ),
