@@ -59,6 +59,27 @@ def load_bas_videos(directory_path: str, resolution: int) -> List["SoccerVideo"]
     return videos
 
 
+def load_competition_videos(directory_path: str, resolution: int, labels_enum) -> List["SoccerVideo"]:
+    videos = []
+    for league_name in os.listdir(directory_path):
+        for season_name in os.listdir(os.path.join(directory_path, league_name)):
+            for match_label in os.listdir(
+                os.path.join(directory_path, league_name, season_name)
+            ):
+                soccer_video = SoccerVideo.bas_video_from_path(
+                    os.path.join(
+                        directory_path,
+                        league_name,
+                        season_name,
+                        match_label,
+                    ),
+                    resolution,
+                    labels_enum=labels_enum,
+                )
+                videos.append(soccer_video)
+    return videos
+
+
 import subprocess
 
 

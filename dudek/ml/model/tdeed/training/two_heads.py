@@ -57,6 +57,7 @@ def train(
     save_as: Optional[str] = "best.pt",
     lr: float = 0.0004,
     loss_weights=None,
+    per_class_weights=None,
 ):
 
     assert eval_metric in ["loss", "map"], "eval_metric must be loss or map"
@@ -176,6 +177,7 @@ def train(
             epoch_nr=epoch_nr,
             loss_weights=loss_weights or [1.5, 1],
             is_main=_is_main,
+            per_class_weights=per_class_weights,
         )
 
         if _is_main and val_dataset is not None:
@@ -188,6 +190,7 @@ def train(
                         data_loader=eval_data_loader,
                         foreground_weight=foreground_weight,
                         device=device,
+                        per_class_weights=per_class_weights,
                     )
                     if eval_loss.total_loss < best_eval_metric:
                         best_eval_metric = eval_loss.total_loss
@@ -237,6 +240,7 @@ def _get_eval_loss(
     data_loader: DataLoader[TeamTDeedDataset],
     foreground_weight: int = 5,
     device=DEFAULT_DEVICE,
+    per_class_weights=None,
 ) -> TDeedLoss:
     epoch_loss_c, epoch_loss_d = _go_through_epoch_eval(
         model,
@@ -244,6 +248,7 @@ def _get_eval_loss(
         data_loader=data_loader,
         foreground_weight=foreground_weight,
         device=device,
+        per_class_weights=per_class_weights,
     )
     epoch_loss = epoch_loss_c.detach().item()
     epoch_loss += epoch_loss_d.detach().item()
@@ -269,6 +274,7 @@ def _go_through_epoch_train(
     summary_writer: SummaryWriter = None,
     loss_weights=None,
     is_main: bool = True,
+    per_class_weights=None,
 ):
     return _go_through_epoch(
         model=model,
@@ -285,6 +291,7 @@ def _go_through_epoch_train(
         summary_writer=summary_writer,
         loss_weights=loss_weights or [1.5, 1],
         is_main=is_main,
+        per_class_weights=per_class_weights,
     )
 
 
@@ -295,6 +302,7 @@ def _go_through_epoch_eval(
     foreground_weight: int = 5,
     device: str = DEFAULT_DEVICE,
     loss_weights=None,
+    per_class_weights=None,
 ):
 
     return _go_through_epoch(
@@ -305,6 +313,7 @@ def _go_through_epoch_eval(
         foreground_weight=foreground_weight,
         device=device,
         loss_weights=loss_weights or [1.5, 1],
+        per_class_weights=per_class_weights,
     )
 
 
@@ -323,6 +332,7 @@ def _go_through_epoch(
     summary_writer: SummaryWriter = None,
     loss_weights=None,
     is_main: bool = True,
+    per_class_weights=None,
 ):
     loss_weights = loss_weights or [1.5, 1]
     if not evaluate:
@@ -331,9 +341,14 @@ def _go_through_epoch(
     epoch_loss_c = 0.0
     epoch_loss_d = 0.0
 
-    class_weights = torch.FloatTensor(
-        [1] + [foreground_weight for _ in labels_enum]
-    ).to(device)
+    if per_class_weights is not None:
+        class_weights = torch.FloatTensor(
+            [1.0] + [foreground_weight * w for w in per_class_weights]
+        ).to(device)
+    else:
+        class_weights = torch.FloatTensor(
+            [1] + [foreground_weight for _ in labels_enum]
+        ).to(device)
 
     _amp_device_type = device.split(":")[0]
 

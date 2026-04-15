@@ -264,7 +264,7 @@ class SoccerVideo:
         return hash(self.absolute_path)
 
     @classmethod
-    def bas_video_from_path(cls, video_dir_path: str, resolution: int) -> "SoccerVideo":
+    def bas_video_from_path(cls, video_dir_path: str, resolution: int, labels_enum=None) -> "SoccerVideo":
 
         video_dir_path = video_dir_path.rstrip("/\\")
 
@@ -280,7 +280,10 @@ class SoccerVideo:
         )
         annotations = None
         if os.path.exists(annotation_path):
-            annotations = Annotation.load_bas_annotations(annotation_path)
+            if labels_enum is None:
+                annotations = Annotation.load_bas_annotations(annotation_path)
+            else:
+                annotations = Annotation.load_annotations(annotation_path, enum_class=labels_enum)
 
         return cls(
             resolution=resolution,
@@ -290,7 +293,7 @@ class SoccerVideo:
             league=league_name,
             match=match_label,
             half=None,
-            labels_class=BASLabel,
+            labels_class=labels_enum if labels_enum is not None else BASLabel,
         )
 
     @classmethod

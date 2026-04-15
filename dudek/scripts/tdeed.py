@@ -10,13 +10,14 @@ from dudek.config import (
     TEST_SET_CHALLENGE_SEED,
 )
 from dudek.data.team_bas import ActionLabel, BASLabel
+from dudek.data.competition import Action, ACTION_CONFIGS
 from dudek.ml.data.tdeed import TeamTDeedDataset
 from dudek.ml.model.tdeed.eval.two_heads import BASTeamTDeedEvaluator
 from dudek.ml.model.tdeed.modules.tdeed import TDeedModule
 
 
 from dudek.ml.model.tdeed.training.two_heads import train as train_tdeed
-from dudek.utils.video import load_action_spotting_videos, load_bas_videos
+from dudek.utils.video import load_action_spotting_videos, load_bas_videos, load_competition_videos
 
 import click
 
@@ -528,6 +529,153 @@ def create_solution(
     evaluator.create_solution_file(
         scored_videos=scored_videos,
         zip_output_file_name=solution_archive_file_base_name,
+    )
+
+
+@cli.command()
+@click.option("--dataset_path", type=str, required=True)
+@click.option("--resolution", type=int, default=224)
+@click.option("--clip_frames_count", type=int, default=80)
+@click.option("--overlap", type=int, default=68)
+@click.option("--displacement", type=int, default=4)
+@click.option("--flip_proba", type=float, default=0.2)
+@click.option("--camera_move_proba", type=float, default=0.2)
+@click.option("--crop_proba", type=float, default=0.2)
+@click.option("--even_choice_proba", type=float, default=0.0)
+@click.option("--nr_epochs", type=int, default=40)
+@click.option("--warm_up_epochs", type=int, default=1)
+@click.option("--learning_rate", type=float, default=0.0006)
+@click.option("--train_batch_size", type=int, default=8)
+@click.option("--val_batch_size", type=int, default=8)
+@click.option("--loss_foreground_weight", type=int, default=5)
+@click.option("--eval_metric", type=str, default="loss")
+@click.option("--start_eval_epoch_nr", type=int, default=0)
+@click.option("--features_model_name", type=str, default="regnety_008")
+@click.option("--temporal_shift_mode", type=str, default="gsf")
+@click.option("--acc_grad_iter", type=int, default=1)
+@click.option("--enforce_train_epoch_size", type=int, default=None)
+@click.option("--enforce_val_epoch_size", type=int, default=None)
+@click.option("--gaussian_blur_kernel_size", type=int, default=5)
+@click.option("--tdeed_arch_n_layers", type=int, default=2)
+@click.option("--tdeed_arch_sgp_ks", type=int, default=5)
+@click.option("--tdeed_arch_sgp_k", type=int, default=4)
+@click.option("--model_checkpoint_path", type=str, default=None)
+@click.option("--save_as", type=str, default="tdeed_competition.pt")
+@click.option("--experiment_name", type=str, default="tdeed_competition")
+@click.option("--val_split", type=float, default=0.1)
+@click.option("--random_seed", type=int, default=EXPERIMENTS_RANDOM_SEED)
+@click.option("--use_wandb", type=bool, default=False)
+def train_competition(
+    dataset_path: str,
+    resolution: int = 224,
+    clip_frames_count: int = 80,
+    overlap: int = 68,
+    displacement: int = 4,
+    flip_proba: float = 0.2,
+    camera_move_proba: float = 0.2,
+    crop_proba: float = 0.2,
+    even_choice_proba: float = 0.0,
+    nr_epochs: int = 40,
+    warm_up_epochs: int = 1,
+    learning_rate: float = 0.0006,
+    train_batch_size: int = 8,
+    val_batch_size: int = 8,
+    loss_foreground_weight: int = 5,
+    eval_metric: str = "loss",
+    start_eval_epoch_nr: int = 0,
+    features_model_name: str = "regnety_008",
+    temporal_shift_mode: str = "gsf",
+    acc_grad_iter: int = 1,
+    enforce_train_epoch_size: int = None,
+    enforce_val_epoch_size: int = None,
+    gaussian_blur_kernel_size: int = 5,
+    tdeed_arch_n_layers: int = 2,
+    tdeed_arch_sgp_ks: int = 5,
+    tdeed_arch_sgp_k: int = 4,
+    model_checkpoint_path: str = None,
+    save_as: str = "tdeed_competition.pt",
+    experiment_name: str = "tdeed_competition",
+    val_split: float = 0.1,
+    random_seed: int = EXPERIMENTS_RANDOM_SEED,
+    use_wandb: bool = False,
+):
+    assert resolution in [224, 720]
+    if use_wandb:
+        wandb.init(project=experiment_name, sync_tensorboard=True)
+
+    videos = load_competition_videos(dataset_path, resolution=resolution, labels_enum=Action)
+    all_clips = []
+    for v in tqdm(videos, desc="Loading clips ..."):
+        clips = v.get_clips(accepted_gap=2)
+        for clip in clips:
+            all_clips += clip.split(clip_frames_count=clip_frames_count, overlap=overlap)
+
+    all_dataset = TeamTDeedDataset(
+        all_clips,
+        labels_enum=Action,
+        displacement=displacement,
+        return_dict=True,
+        flip_proba=flip_proba,
+        camera_move_proba=camera_move_proba,
+        crop_proba=crop_proba,
+        even_choice_proba=even_choice_proba,
+    )
+
+    n_matches = len(all_dataset.get_unique_matches())
+    assert n_matches >= 2, f"Need at least 2 unique clips, got {n_matches}"
+    n_val = max(1, round(n_matches * val_split))
+    n_train = n_matches - n_val
+    print(f"Splitting {n_matches} clips → train={n_train}, val={n_val}")
+    train_dataset, val_dataset = all_dataset.split_by_matches(
+        counts=[n_train, n_val], random_seed=random_seed
+    )
+
+    if enforce_train_epoch_size is not None:
+        train_dataset.enforced_epoch_size = enforce_train_epoch_size
+    if enforce_val_epoch_size is not None:
+        val_dataset.enforced_epoch_size = enforce_val_epoch_size
+
+    if eval_metric == "map":
+        val_dataset.return_dict = False
+    val_dataset.flip_proba = 0.0
+    val_dataset.camera_move_proba = 0.0
+    val_dataset.crop_proba = 0.0
+    val_dataset.even_choice_proba = 0.0
+
+    per_class_weights = [ACTION_CONFIGS[label].weight for label in Action]
+
+    tdeed_model = TDeedModule(
+        clip_len=clip_frames_count,
+        n_layers=tdeed_arch_n_layers,
+        sgp_ks=tdeed_arch_sgp_ks,
+        sgp_k=tdeed_arch_sgp_k,
+        num_classes=len(Action),
+        features_model_name=features_model_name,
+        temporal_shift_mode=temporal_shift_mode,
+        gaussian_blur_ks=gaussian_blur_kernel_size,
+    )
+    if model_checkpoint_path:
+        tdeed_model.load_backbone(model_weight_path=model_checkpoint_path)
+
+    train_tdeed(
+        experiment_name=experiment_name,
+        model=tdeed_model,
+        labels_enum=Action,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        eval_metric=eval_metric,
+        nr_epochs=nr_epochs,
+        start_eval_epoch_nr=start_eval_epoch_nr,
+        foreground_weight=loss_foreground_weight,
+        train_batch_size=train_batch_size,
+        val_batch_size=val_batch_size,
+        device=DEFAULT_DEVICE,
+        acc_grad_iter=acc_grad_iter,
+        save_as=save_as,
+        lr=learning_rate,
+        loss_weights=[1.5, 1],
+        warm_up_epochs=warm_up_epochs,
+        per_class_weights=per_class_weights,
     )
 
 

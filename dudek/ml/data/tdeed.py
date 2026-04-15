@@ -63,26 +63,31 @@ class TdeedVideoClip:
         labels = []
         displacements = []
 
+        # Collect all annotated frames: (frame_idx, label_value)
+        event_frames = []
         for idx, frame in enumerate(video_clip.frames):
             if frame.annotation:
-
                 label_value = labels2int_map[frame.annotation.label]
+                event_frames.append((idx, label_value))
 
-                start_disp = -labels_displacement
-                end_disp = labels_displacement
-
-                valid_disps = np.arange(
-                    max(start_disp, -idx),
-                    min(end_disp + 1, num_frames - idx),
-                    dtype=np.int64,
-                )
-
-                displaced_indices = idx + valid_disps
-                annotated_indices.extend(displaced_indices)
-                labels.extend([label_value] * len(displaced_indices))
-
+        # Nearest-event-wins: each frame within any event's displacement window
+        # is assigned to the closest event, breaking ties toward the earlier event.
+        # With 1-frame offsets between simultaneous events no ties can occur.
+        for frame_idx in range(num_frames):
+            best_event_idx = None
+            best_label = None
+            best_dist = labels_displacement + 1
+            for event_idx, label_value in event_frames:
+                dist = abs(frame_idx - event_idx)
+                if dist <= labels_displacement and dist < best_dist:
+                    best_dist = dist
+                    best_event_idx = event_idx
+                    best_label = label_value
+            if best_event_idx is not None:
+                annotated_indices.append(frame_idx)
+                labels.append(best_label)
                 if labels_displacement:
-                    displacements.extend(valid_disps)
+                    displacements.append(frame_idx - best_event_idx)
 
         if annotated_indices:
             annotated_indices = np.array(annotated_indices, dtype=np.int64)
