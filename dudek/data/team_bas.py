@@ -137,9 +137,14 @@ class Annotation:
                         team = Team.from_label_json(label_json["team"])
                         if random_team_when_no_team and team == Team.NOT_APPLICABLE:
                             team = Team.RIGHT if np.random.rand() > 0.5 else Team.LEFT
+                        label_str = label_json["label"]
+                        label_map = {v.value.lower(): v for v in enum_class}
+                        label = label_map.get(label_str.lower())
+                        if label is None:
+                            raise ValueError(f"'{label_str}' is not a valid {enum_class.__name__}")
                         labels.append(
                             Annotation(
-                                label=enum_class(label_json["label"].lower()),
+                                label=label,
                                 position=int(label_json["position"]),
                                 game_time=label_json["gameTime"],
                                 team=team,
