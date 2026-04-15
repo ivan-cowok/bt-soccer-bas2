@@ -565,6 +565,7 @@ def create_solution(
 @click.option("--val_split", type=float, default=0.1)
 @click.option("--random_seed", type=int, default=EXPERIMENTS_RANDOM_SEED)
 @click.option("--use_wandb", type=bool, default=False)
+@click.option("--num_workers", type=int, default=4)
 def train_competition(
     dataset_path: str,
     resolution: int = 224,
@@ -598,6 +599,7 @@ def train_competition(
     val_split: float = 0.1,
     random_seed: int = EXPERIMENTS_RANDOM_SEED,
     use_wandb: bool = False,
+    num_workers: int = 4,
 ):
     assert resolution in [224, 720]
     if use_wandb:
@@ -676,6 +678,7 @@ def train_competition(
         loss_weights=[1.5, 1],
         warm_up_epochs=warm_up_epochs,
         per_class_weights=per_class_weights,
+        num_workers=num_workers,
     )
 
 

@@ -58,6 +58,7 @@ def train(
     lr: float = 0.0004,
     loss_weights=None,
     per_class_weights=None,
+    num_workers: int = 4,
 ):
 
     assert eval_metric in ["loss", "map"], "eval_metric must be loss or map"
@@ -100,10 +101,16 @@ def train(
         batch_size=train_batch_size,
         shuffle=(train_sampler is None),
         sampler=train_sampler,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=num_workers > 0,
     )
     if val_dataset is not None:
         eval_data_loader = DataLoader(
-            val_dataset, batch_size=val_batch_size, shuffle=True
+            val_dataset, batch_size=val_batch_size, shuffle=True,
+            num_workers=num_workers,
+            pin_memory=True,
+            persistent_workers=num_workers > 0,
         )
 
     optimizer_steps_per_epoch = len(train_data_loader) // acc_grad_iter

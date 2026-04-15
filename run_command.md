@@ -31,7 +31,7 @@ uv run python dudek/scripts/tdeed.py train-competition \
     --nr_epochs=40 \
     --save_as=tdeed_competition.pt
 
-    
+
 uv run bas-frame-extract extract-bas-frames \
     --dataset_path=/workspace/bas/data/competition_videos/ \
     --resolution=224 \
@@ -40,10 +40,14 @@ uv run bas-frame-extract extract-bas-frames \
     --frame_target_width=224 \
     --frame_target_height=224
 
-
-uv run python dudek/scripts/extract.py extract-competition-frames \
+uv run python dudek/scripts/tdeed.py train-competition \
     --dataset_path=/workspace/bas/data/competition_videos/ \
-    --resolution=224 \
-    --stride=1 \
-    --frame_target_width=224 \
-    --frame_target_height=224
+    --model_checkpoint_path=/workspace/bas/bt-soccer-bas2/pretrained.pt \
+    --clip_frames_count=160 \
+    --overlap=136 \
+    --nr_epochs=40 \
+    --learning_rate=0.0001 \
+    --train_batch_size=8 \
+    --val_batch_size=8 \
+    --num_workers=8 \
+    --save_as=tdeed_competition.pt
