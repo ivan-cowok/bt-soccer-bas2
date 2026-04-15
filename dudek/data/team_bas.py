@@ -275,7 +275,7 @@ class SoccerVideo:
 
         absolute_path = os.path.join(
             video_dir_path,
-            f"{resolution}.mp4",
+            f"{resolution}p.mp4",
         )
         season_name, league_name, match_label = _path_tail_three(video_dir_path)
 
