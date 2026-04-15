@@ -139,7 +139,7 @@ class Annotation:
                             team = Team.RIGHT if np.random.rand() > 0.5 else Team.LEFT
                         labels.append(
                             Annotation(
-                                label=enum_class(label_json["label"]),
+                                label=enum_class(label_json["label"].lower()),
                                 position=int(label_json["position"]),
                                 game_time=label_json["gameTime"],
                                 team=team,
