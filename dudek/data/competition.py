@@ -11,9 +11,7 @@ class ActionConfig(NamedTuple):
 class Action(str, enum.Enum):
     PASS = "pass"
     PASS_RECEIVED = "pass_received"
-    RECOVERY = "recovery"
     TACKLE = "tackle"
-    INTERCEPTION = "interception"
     BALL_OUT_OF_PLAY = "ball_out_of_play"
     CLEARANCE = "clearance"
     AERIAL_DUEL = "aerial_duel"
@@ -26,9 +24,7 @@ class Action(str, enum.Enum):
 ACTION_CONFIGS: dict[Action, ActionConfig] = {
     Action.PASS: ActionConfig(1.0, 0.0, 1.0),
     Action.PASS_RECEIVED: ActionConfig(1.4, 0.0, 1.0),
-    Action.RECOVERY: ActionConfig(1.5, 0.0, 1.5),
     Action.TACKLE: ActionConfig(2.5, 0.1, 1.5),
-    Action.INTERCEPTION: ActionConfig(2.8, 0.5, 2.0),
     Action.BALL_OUT_OF_PLAY: ActionConfig(2.9, 0.5, 2.0),
     Action.CLEARANCE: ActionConfig(3.1, 0.5, 2.0),
     Action.AERIAL_DUEL: ActionConfig(4.3, 0.5, 2.0),
