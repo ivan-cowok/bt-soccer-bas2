@@ -47,7 +47,24 @@ uv run python dudek/scripts/tdeed.py train-competition \
     --overlap=136 \
     --nr_epochs=40 \
     --learning_rate=0.0001 \
+    --train_batch_size=6 \
+    --val_batch_size=6 \
+    --num_workers=8 \
+    --save_as=tdeed_competition.pt
+
+uv run python dudek/scripts/tdeed.py train-competition \
+    --dataset_path=/workspace/bas/data/competition_videos/ \
+    --model_checkpoint_path=/workspace/bas/bt-soccer-bas2/pretrained.pt \
+    --clip_frames_count=160 \
+    --overlap=136 \
+    --nr_epochs=60 \
+    --learning_rate=0.00002 \
     --train_batch_size=8 \
     --val_batch_size=8 \
     --num_workers=8 \
+    --flip_proba=0.5 \
+    --crop_proba=0.4 \
+    --camera_move_proba=0.4 \
+    --even_choice_proba=0.5 \
+    --loss_foreground_weight=3 \
     --save_as=tdeed_competition.pt

@@ -612,6 +612,9 @@ def train_competition(
         for clip in clips:
             all_clips += clip.split(clip_frames_count=clip_frames_count, overlap=overlap)
 
+    n_with_events = sum(1 for c in all_clips if c.has_events)
+    print(f"Total sub-clips: {len(all_clips)}, with events: {n_with_events} ({100*n_with_events/len(all_clips):.1f}%)")
+
     all_dataset = TeamTDeedDataset(
         all_clips,
         labels_enum=Action,
@@ -644,7 +647,7 @@ def train_competition(
     val_dataset.crop_proba = 0.0
     val_dataset.even_choice_proba = 0.0
 
-    per_class_weights = [ACTION_CONFIGS[label].weight for label in Action]
+    per_class_weights = None  # disabled: extreme weights (up to 54x) cause divergence
 
     tdeed_model = TDeedModule(
         clip_len=clip_frames_count,
