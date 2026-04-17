@@ -4,7 +4,7 @@ import random
 import timm
 import torch
 from torch import nn
-import torchvision.transforms as T
+import torchvision.transforms.v2 as T
 
 
 from collections import OrderedDict

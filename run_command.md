@@ -37,8 +37,8 @@ uv run bas-frame-extract extract-bas-frames \
     --resolution=224 \
     --save_all=true \
     --stride=1 \
-    --frame_target_width=224 \
-    --frame_target_height=224
+    --frame_target_width=768 \
+    --frame_target_height=432
 
 uv run python dudek/scripts/tdeed.py train-competition \
     --dataset_path=/workspace/bas/data/competition_videos/ \
