@@ -104,7 +104,6 @@ def train(
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=num_workers > 0,
-        prefetch_factor=4 if num_workers > 0 else None,
     )
     if val_dataset is not None:
         eval_data_loader = DataLoader(
@@ -112,7 +111,6 @@ def train(
             num_workers=num_workers,
             pin_memory=True,
             persistent_workers=num_workers > 0,
-            prefetch_factor=4 if num_workers > 0 else None,
         )
 
     optimizer_steps_per_epoch = len(train_data_loader) // acc_grad_iter
