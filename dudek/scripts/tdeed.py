@@ -562,6 +562,7 @@ def create_solution(
 @click.option("--model_checkpoint_path", type=str, default=None)
 @click.option("--save_as", type=str, default="tdeed_competition.pt")
 @click.option("--experiment_name", type=str, default="tdeed_competition")
+@click.option("--val_dataset_path", type=str, default=None)
 @click.option("--val_split", type=float, default=0.1)
 @click.option("--random_seed", type=int, default=EXPERIMENTS_RANDOM_SEED)
 @click.option("--use_wandb", type=bool, default=False)
@@ -596,6 +597,7 @@ def train_competition(
     model_checkpoint_path: str = None,
     save_as: str = "tdeed_competition.pt",
     experiment_name: str = "tdeed_competition",
+    val_dataset_path: str = None,
     val_split: float = 0.1,
     random_seed: int = EXPERIMENTS_RANDOM_SEED,
     use_wandb: bool = False,
@@ -626,14 +628,33 @@ def train_competition(
         even_choice_proba=even_choice_proba,
     )
 
-    n_matches = len(all_dataset.get_unique_matches())
-    assert n_matches >= 2, f"Need at least 2 unique clips, got {n_matches}"
-    n_val = max(1, round(n_matches * val_split))
-    n_train = n_matches - n_val
-    print(f"Splitting {n_matches} clips → train={n_train}, val={n_val}")
-    train_dataset, val_dataset = all_dataset.split_by_matches(
-        counts=[n_train, n_val], random_seed=random_seed
-    )
+    if val_dataset_path is not None:
+        val_videos = load_competition_videos(val_dataset_path, resolution=resolution, labels_enum=Action)
+        val_clips = []
+        for v in tqdm(val_videos, desc="Loading val clips ..."):
+            for clip in v.get_clips(accepted_gap=2):
+                val_clips += clip.split(clip_frames_count=clip_frames_count, overlap=overlap)
+        print(f"Val set (separate path): {len(val_videos)} videos, {len(val_clips)} sub-clips")
+        val_dataset = TeamTDeedDataset(
+            val_clips,
+            labels_enum=Action,
+            displacement=displacement,
+            return_dict=True,
+            flip_proba=0.0,
+            camera_move_proba=0.0,
+            crop_proba=0.0,
+            even_choice_proba=0.0,
+        )
+        train_dataset = all_dataset
+    else:
+        n_matches = len(all_dataset.get_unique_matches())
+        assert n_matches >= 2, f"Need at least 2 unique clips, got {n_matches}"
+        n_val = max(1, round(n_matches * val_split))
+        n_train = n_matches - n_val
+        print(f"Splitting {n_matches} clips → train={n_train}, val={n_val}")
+        train_dataset, val_dataset = all_dataset.split_by_matches(
+            counts=[n_train, n_val], random_seed=random_seed
+        )
 
     if enforce_train_epoch_size is not None:
         train_dataset.enforced_epoch_size = enforce_train_epoch_size

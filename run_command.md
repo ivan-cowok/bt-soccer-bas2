@@ -42,15 +42,16 @@ uv run bas-frame-extract extract-bas-frames \
 
 uv run python dudek/scripts/tdeed.py train-competition \
     --dataset_path=/workspace/bas/data/competition_videos/ \
+    --val_dataset_path=/workspace/bas/data/competition_videos_val/ \
     --model_checkpoint_path=/workspace/bas/bt-soccer-bas2/pretrained.pt \
     --clip_frames_count=160 \
     --overlap=136 \
     --nr_epochs=30 \
-    --learning_rate=0.00005 \
+    --learning_rate=0.000005 \
     --train_batch_size=1 \
     --val_batch_size=1 \
     --acc_grad_iter=4 \
-    --num_workers=12 \
+    --num_workers=14 \
     --flip_proba=0.5 \
     --crop_proba=0.4 \
     --camera_move_proba=0.4 \
