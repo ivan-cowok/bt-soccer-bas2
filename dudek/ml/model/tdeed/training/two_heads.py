@@ -59,6 +59,8 @@ def train(
     loss_weights=None,
     per_class_weights=None,
     num_workers: int = 4,
+    weight_decay: float = 0.0,
+    backbone_lr_scale: float = 1.0,
 ):
 
     assert eval_metric in ["loss", "map"], "eval_metric must be loss or map"
@@ -88,7 +90,26 @@ def train(
         )
 
     raw_model = model.module if isinstance(model, DDP) else model
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    backbone_lr = lr * backbone_lr_scale
+    param_groups = [
+        {
+            "params": [p for p in raw_model._features.parameters() if p.requires_grad],
+            "lr": backbone_lr,
+        },
+        {
+            "params": [
+                p for name, p in raw_model.named_parameters()
+                if not name.startswith("_features") and p.requires_grad
+            ],
+            "lr": lr,
+        },
+    ]
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+    if _is_main:
+        print(
+            f"Optimizer: backbone_lr={backbone_lr:.2e}  "
+            f"head_lr={lr:.2e}  weight_decay={weight_decay}"
+        )
     scaler = torch.amp.GradScaler("cuda") if "cuda" in device else None
 
     if _is_ddp:

@@ -567,6 +567,9 @@ def create_solution(
 @click.option("--random_seed", type=int, default=EXPERIMENTS_RANDOM_SEED)
 @click.option("--use_wandb", type=bool, default=False)
 @click.option("--num_workers", type=int, default=4)
+@click.option("--freeze_backbone", type=bool, default=False)
+@click.option("--weight_decay", type=float, default=0.0)
+@click.option("--backbone_lr_scale", type=float, default=0.1)
 def train_competition(
     dataset_path: str,
     resolution: int = 224,
@@ -602,6 +605,9 @@ def train_competition(
     random_seed: int = EXPERIMENTS_RANDOM_SEED,
     use_wandb: bool = False,
     num_workers: int = 4,
+    freeze_backbone: bool = False,
+    weight_decay: float = 0.0,
+    backbone_lr_scale: float = 0.1,
 ):
     assert resolution in [224, 720]
     if use_wandb:
@@ -682,6 +688,11 @@ def train_competition(
     )
     if model_checkpoint_path:
         tdeed_model.load_backbone(model_weight_path=model_checkpoint_path)
+    if freeze_backbone:
+        tdeed_model.freeze_backbone()
+        trainable = sum(p.numel() for p in tdeed_model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in tdeed_model.parameters())
+        print(f"Backbone frozen. Trainable params: {trainable:,} / {total:,}")
 
     train_tdeed(
         experiment_name=experiment_name,
@@ -703,6 +714,8 @@ def train_competition(
         warm_up_epochs=warm_up_epochs,
         per_class_weights=per_class_weights,
         num_workers=num_workers,
+        weight_decay=weight_decay,
+        backbone_lr_scale=0.0 if freeze_backbone else backbone_lr_scale,
     )
 
 

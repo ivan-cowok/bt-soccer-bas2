@@ -47,7 +47,7 @@ uv run python dudek/scripts/tdeed.py train-competition \
     --clip_frames_count=160 \
     --overlap=136 \
     --nr_epochs=30 \
-    --learning_rate=0.000005 \
+    --learning_rate=0.00001 \
     --train_batch_size=1 \
     --val_batch_size=1 \
     --acc_grad_iter=4 \
@@ -57,4 +57,6 @@ uv run python dudek/scripts/tdeed.py train-competition \
     --camera_move_proba=0.4 \
     --even_choice_proba=0.5 \
     --loss_foreground_weight=5 \
+    --backbone_lr_scale=0.1 \
+    --weight_decay=0.01 \
     --save_as=tdeed_competition_768.pt

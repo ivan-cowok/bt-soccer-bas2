@@ -166,6 +166,14 @@ class TDeedModule(nn.Module):
         )
         self._temp_fine.load_state_dict(_temp_fine_layers)
 
+    def freeze_backbone(self):
+        for param in self._features.parameters():
+            param.requires_grad = False
+
+    def unfreeze_backbone(self):
+        for param in self._features.parameters():
+            param.requires_grad = True
+
     def load_all(self, model_weight_path: str):
         m = torch.load(
             model_weight_path, map_location=torch.device("cpu"), weights_only=True
