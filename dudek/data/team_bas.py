@@ -568,7 +568,15 @@ class SoccerVideo:
         if self.annotations:
             for annotation in self.annotations:
                 frame_nr = annotation.get_frame_nr(fps=self.metadata_fps)
-                frame_nr_to_annotation_dict[frame_nr] = annotation
+                if frame_nr not in frame_nr_to_annotation_dict:
+                    frame_nr_to_annotation_dict[frame_nr] = annotation
+                else:
+                    existing = frame_nr_to_annotation_dict[frame_nr]
+                    raise ValueError(
+                        f"Two annotations map to the same frame {frame_nr}: "
+                        f"{existing.label} and {annotation.label}. "
+                        f"Ensure events are at least 1 frame apart (40ms at 25fps)."
+                    )
         return frame_nr_to_annotation_dict
 
     @cached_property
