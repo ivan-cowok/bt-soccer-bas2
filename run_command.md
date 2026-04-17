@@ -45,26 +45,15 @@ uv run python dudek/scripts/tdeed.py train-competition \
     --model_checkpoint_path=/workspace/bas/bt-soccer-bas2/pretrained.pt \
     --clip_frames_count=160 \
     --overlap=136 \
-    --nr_epochs=40 \
-    --learning_rate=0.0001 \
-    --train_batch_size=6 \
-    --val_batch_size=6 \
-    --num_workers=8 \
-    --save_as=tdeed_competition.pt
-
-uv run python dudek/scripts/tdeed.py train-competition \
-    --dataset_path=/workspace/bas/data/competition_videos/ \
-    --model_checkpoint_path=/workspace/bas/bt-soccer-bas2/pretrained.pt \
-    --clip_frames_count=160 \
-    --overlap=136 \
-    --nr_epochs=60 \
+    --nr_epochs=30 \
     --learning_rate=0.00005 \
-    --train_batch_size=6 \
-    --val_batch_size=6 \
-    --num_workers=10 \
+    --train_batch_size=1 \
+    --val_batch_size=1 \
+    --acc_grad_iter=4 \
+    --num_workers=12 \
     --flip_proba=0.5 \
     --crop_proba=0.4 \
     --camera_move_proba=0.4 \
     --even_choice_proba=0.5 \
     --loss_foreground_weight=5 \
-    --save_as=tdeed_competition.pt
+    --save_as=tdeed_competition_768.pt
