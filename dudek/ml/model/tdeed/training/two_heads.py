@@ -375,6 +375,10 @@ def _go_through_epoch(
     class_names = ["background"] + [c.name for c in labels_enum]
     ce_per_class_sum = torch.zeros(n_classes, device=device)
     ce_per_class_cnt = torch.zeros(n_classes, device=device)
+    pred_count = torch.zeros(n_classes, device=device)
+    true_count = torch.zeros(n_classes, device=device)
+    max_prob_sum = torch.zeros(1, device=device)
+    max_prob_cnt = torch.zeros(1, device=device)
 
     if per_class_weights is not None:
         class_weights = torch.FloatTensor(
@@ -436,11 +440,18 @@ def _go_through_epoch(
                 ce_none = F.cross_entropy(
                     predictions.float(), label_idx, reduction="none"
                 )
+                probs = predictions.float().softmax(dim=-1)
+                pred_idx = probs.argmax(dim=-1)
+                max_prob = probs.max(dim=-1).values
+                max_prob_sum += max_prob.sum()
+                max_prob_cnt += max_prob.numel()
                 for c in range(n_classes):
                     mask = label_idx == c
                     if mask.any():
                         ce_per_class_sum[c] += ce_none[mask].sum()
                         ce_per_class_cnt[c] += mask.sum()
+                    true_count[c] += mask.sum()
+                    pred_count[c] += (pred_idx == c).sum()
 
             if not evaluate:
                 if is_main and summary_writer:
@@ -481,6 +492,32 @@ def _go_through_epoch(
         header = f"[{phase} epoch {epoch_nr}] per-class CE (unweighted):"
         parts = [f"{k}={v:.3f}" for k, v in ce_per_class.items()]
         print(header + " " + "  ".join(parts))
+
+    total_true = true_count.sum().item()
+    total_pred = pred_count.sum().item()
+    if is_main and total_pred > 0:
+        avg_confidence = (max_prob_sum / max_prob_cnt.clamp(min=1)).item()
+        print(f"[{phase} epoch {epoch_nr}] prediction distribution (argmax):")
+        for c in range(n_classes):
+            tc = true_count[c].item()
+            pc = pred_count[c].item()
+            true_pct = 100 * tc / total_true if total_true > 0 else 0
+            pred_pct = 100 * pc / total_pred if total_pred > 0 else 0
+            print(
+                f"    {class_names[c]:<20s} true={tc:>8.0f} ({true_pct:5.2f}%)  "
+                f"pred={pc:>8.0f} ({pred_pct:5.2f}%)"
+            )
+        print(f"    avg_max_prob(confidence) = {avg_confidence:.3f}")
+        if summary_writer is not None and epoch_nr is not None:
+            summary_writer.add_scalar(
+                f"{phase}_avg_confidence", avg_confidence, epoch_nr
+            )
+            for c in range(n_classes):
+                summary_writer.add_scalar(
+                    f"{phase}_pred_frac/{class_names[c]}",
+                    pred_count[c].item() / max(total_pred, 1),
+                    epoch_nr,
+                )
 
     return epoch_loss_c, epoch_loss_d, ce_per_class
 
