@@ -37,6 +37,7 @@ class TDeedLoss:
     total_loss: float
     ce_labels_loss: float
     mse_displacement_loss: float
+    ce_per_class: Optional[dict] = None
 
 
 def train(
@@ -270,7 +271,7 @@ def _get_eval_loss(
     device=DEFAULT_DEVICE,
     per_class_weights=None,
 ) -> TDeedLoss:
-    epoch_loss_c, epoch_loss_d = _go_through_epoch_eval(
+    epoch_loss_c, epoch_loss_d, ce_per_class = _go_through_epoch_eval(
         model,
         labels_enum=labels_enum,
         data_loader=data_loader,
@@ -285,6 +286,7 @@ def _get_eval_loss(
         total_loss=epoch_loss / len(data_loader),
         ce_labels_loss=epoch_loss_c.detach().item() / len(data_loader),
         mse_displacement_loss=epoch_loss_d.detach().item() / len(data_loader),
+        ce_per_class=ce_per_class,
     )
 
 
@@ -369,6 +371,11 @@ def _go_through_epoch(
     epoch_loss_c = 0.0
     epoch_loss_d = 0.0
 
+    n_classes = len(labels_enum) + 1
+    class_names = ["background"] + [c.name for c in labels_enum]
+    ce_per_class_sum = torch.zeros(n_classes, device=device)
+    ce_per_class_cnt = torch.zeros(n_classes, device=device)
+
     if per_class_weights is not None:
         class_weights = torch.FloatTensor(
             [1.0] + [foreground_weight * w for w in per_class_weights]
@@ -423,6 +430,17 @@ def _go_through_epoch(
                 epoch_loss_d += loss_d * loss_weights[1]
                 loss += loss_d * loss_weights[1]
 
+            with torch.no_grad():
+                label_idx = label if label.dim() == 1 else label.argmax(dim=-1)
+                ce_none = F.cross_entropy(
+                    predictions.float(), label_idx, reduction="none"
+                )
+                for c in range(n_classes):
+                    mask = label_idx == c
+                    if mask.any():
+                        ce_per_class_sum[c] += ce_none[mask].sum()
+                        ce_per_class_cnt[c] += mask.sum()
+
             if not evaluate:
                 if is_main and summary_writer:
                     summary_writer.add_scalar(
@@ -447,7 +465,23 @@ def _go_through_epoch(
                 )
             batch_idx += 1
 
-    return epoch_loss_c, epoch_loss_d
+    ce_per_class = {}
+    for c in range(n_classes):
+        cnt = ce_per_class_cnt[c].item()
+        if cnt > 0:
+            ce_per_class[class_names[c]] = ce_per_class_sum[c].item() / cnt
+
+    phase = "eval" if evaluate else "train"
+    if is_main and summary_writer is not None and epoch_nr is not None:
+        for name, val in ce_per_class.items():
+            summary_writer.add_scalar(f"{phase}_per_class_ce/{name}", val, epoch_nr)
+
+    if is_main and ce_per_class:
+        header = f"[{phase} epoch {epoch_nr}] per-class CE (unweighted):"
+        parts = [f"{k}={v:.3f}" for k, v in ce_per_class.items()]
+        print(header + " " + "  ".join(parts))
+
+    return epoch_loss_c, epoch_loss_d, ce_per_class
 
 
 def _optim_step(scaler, optimizer, scheduler, loss, backward_only=False):

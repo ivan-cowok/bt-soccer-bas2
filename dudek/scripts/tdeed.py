@@ -1,4 +1,8 @@
+import enum
+import math
 import os
+from collections import Counter
+from typing import List, Tuple, Type
 
 import torch
 import wandb
@@ -22,6 +26,39 @@ from dudek.utils.video import load_action_spotting_videos, load_bas_videos, load
 import click
 
 cli = click.Group()
+
+
+def compute_inverse_sqrt_class_weights(
+    videos,
+    labels_enum: Type[enum.Enum],
+    cap: float = 3.0,
+) -> Tuple[List[float], List[int]]:
+    """
+    Inverse-sqrt class weights from annotation counts across videos.
+
+    For class ``c`` with count ``n_c`` and most-common count ``n_max``:
+        w_c = min(sqrt(n_max / n_c), cap)
+
+    Returns (weights_in_enum_order, counts_in_enum_order). Weights are
+    multiplicative relative factors; downstream loss still multiplies by
+    ``foreground_weight``.
+    """
+    counter: Counter = Counter()
+    for v in videos:
+        for ann in getattr(v, "annotations", None) or []:
+            counter[ann.label] += 1
+    class_list = list(labels_enum)
+    counts = [counter.get(c, 0) for c in class_list]
+    n_max = max(counts) if counts else 1
+    if n_max == 0:
+        n_max = 1
+    weights: List[float] = []
+    for n in counts:
+        if n <= 0:
+            weights.append(float(cap))
+        else:
+            weights.append(float(min(math.sqrt(n_max / n), cap)))
+    return weights, counts
 
 
 @cli.command()
@@ -570,6 +607,8 @@ def create_solution(
 @click.option("--freeze_backbone", type=bool, default=False)
 @click.option("--weight_decay", type=float, default=0.0)
 @click.option("--backbone_lr_scale", type=float, default=0.1)
+@click.option("--class_weight_mode", type=click.Choice(["none", "inverse_sqrt"]), default="none")
+@click.option("--class_weight_cap", type=float, default=3.0)
 def train_competition(
     dataset_path: str,
     resolution: int = 224,
@@ -608,6 +647,8 @@ def train_competition(
     freeze_backbone: bool = False,
     weight_decay: float = 0.0,
     backbone_lr_scale: float = 0.1,
+    class_weight_mode: str = "none",
+    class_weight_cap: float = 3.0,
 ):
     assert resolution in [224, 720]
     if use_wandb:
@@ -674,7 +715,16 @@ def train_competition(
     val_dataset.crop_proba = 0.0
     val_dataset.even_choice_proba = 0.0
 
-    per_class_weights = None  # disabled: extreme weights (up to 54x) cause divergence
+    if class_weight_mode == "inverse_sqrt":
+        per_class_weights, class_counts = compute_inverse_sqrt_class_weights(
+            videos, labels_enum=Action, cap=class_weight_cap
+        )
+        print(f"Class weights (inverse_sqrt, cap={class_weight_cap}):")
+        for cls, w, n in zip(Action, per_class_weights, class_counts):
+            print(f"  {cls.name:<20s} n={n:<5d} weight={w:.3f}")
+    else:
+        per_class_weights = None
+        print("Class weights: uniform foreground_weight for all event classes")
 
     tdeed_model = TDeedModule(
         clip_len=clip_frames_count,
