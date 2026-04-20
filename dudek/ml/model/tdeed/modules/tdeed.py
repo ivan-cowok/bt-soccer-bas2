@@ -33,6 +33,7 @@ class TDeedModule(nn.Module):
         features_model_name: str = "regnety_002",
         temporal_shift_mode: str = "gsf",
         gaussian_blur_ks: int = 3,
+        grad_checkpointing: bool = False,
     ):
         super().__init__()
 
@@ -41,11 +42,14 @@ class TDeedModule(nn.Module):
         self.sgp_k = sgp_k
         self.sgp_ks = sgp_ks
         self.n_layers = n_layers
+        self.grad_checkpointing = grad_checkpointing
 
         features = timm.create_model(
             features_model_name,
             pretrained=True,
         )
+        if grad_checkpointing and hasattr(features, "set_grad_checkpointing"):
+            features.set_grad_checkpointing(True)
 
         feat_dim = features.get_classifier().in_features
         features.reset_classifier(0)

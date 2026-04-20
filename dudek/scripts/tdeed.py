@@ -609,6 +609,7 @@ def create_solution(
 @click.option("--backbone_lr_scale", type=float, default=0.1)
 @click.option("--class_weight_mode", type=click.Choice(["none", "inverse_sqrt"]), default="none")
 @click.option("--class_weight_cap", type=float, default=3.0)
+@click.option("--grad_checkpointing", type=bool, default=False)
 def train_competition(
     dataset_path: str,
     resolution: int = 224,
@@ -649,6 +650,7 @@ def train_competition(
     backbone_lr_scale: float = 0.1,
     class_weight_mode: str = "none",
     class_weight_cap: float = 3.0,
+    grad_checkpointing: bool = False,
 ):
     assert resolution in [224, 720]
     if use_wandb:
@@ -735,6 +737,7 @@ def train_competition(
         features_model_name=features_model_name,
         temporal_shift_mode=temporal_shift_mode,
         gaussian_blur_ks=gaussian_blur_kernel_size,
+        grad_checkpointing=grad_checkpointing,
     )
     if model_checkpoint_path:
         tdeed_model.load_backbone(model_weight_path=model_checkpoint_path)
