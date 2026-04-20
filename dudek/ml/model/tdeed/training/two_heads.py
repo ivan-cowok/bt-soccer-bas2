@@ -417,7 +417,6 @@ def _go_through_epoch(
                 predictions = pred.reshape(-1, len(labels_enum) + 1)
                 loss_c += F.cross_entropy(predictions, label, weight=class_weights)
 
-                epoch_loss_c += loss_c * loss_weights[0]
                 loss += loss_c * loss_weights[0]
 
                 loss_d = F.mse_loss(
@@ -427,8 +426,10 @@ def _go_through_epoch(
                 )
 
                 loss_d = loss_d.mean()
-                epoch_loss_d += loss_d * loss_weights[1]
                 loss += loss_d * loss_weights[1]
+
+            epoch_loss_c += (loss_c * loss_weights[0]).detach()
+            epoch_loss_d += (loss_d * loss_weights[1]).detach()
 
             with torch.no_grad():
                 label_idx = label if label.dim() == 1 else label.argmax(dim=-1)
