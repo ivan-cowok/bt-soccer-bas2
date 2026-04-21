@@ -778,133 +778,38 @@ def train_competition(
 def _build_video_result_json(
     vid_data,
     labels_enum: Type[enum.Enum],
-    class_configs: dict,
-    max_fp_per_class: int = 100,
+    min_confidence: float = 0.0,
 ) -> dict:
-    """Per-video JSON with GT, predictions, and per-class TP/FP/FN matches.
-
-    Uses class-specific tolerance_seconds from class_configs and the video's own fps.
-    False positives are capped at max_fp_per_class to keep the file small.
+    """Per-video JSON containing only predicted annotations, matching the
+    Labels-ball.json ground-truth format.
     """
     video = vid_data.video
     scores = vid_data.scores
-    targets = vid_data.targets
-    num_frames = int(scores.shape[0])
     class_list = list(labels_enum)
     fps = float(video.metadata_fps)
 
-    gt_events: List[dict] = []
+    annotations = []
     for class_idx, cls in enumerate(class_list):
-        for f in np.where(targets[:, class_idx] == 1)[0]:
-            gt_events.append(
+        for f in np.where(scores[:, class_idx] > min_confidence)[0]:
+            conf = float(scores[f, class_idx])
+            position_ms = int(f / fps * 1000)
+            seconds = position_ms / 1000
+            minutes = int(seconds // 60)
+            secs = int(seconds % 60)
+            annotations.append(
                 {
-                    "action": cls.name,
-                    "frame": int(f),
-                    "position_ms": int(f / fps * 1000),
+                    "gameTime": f"1 - {minutes}:{secs:02d}",
+                    "label": cls.value,
+                    "position": str(position_ms),
+                    "team": "not applicable",
+                    "visibility": "visible",
+                    "confidence": conf,
                 }
             )
-    gt_events.sort(key=lambda e: (e["frame"], e["action"]))
 
-    pred_events: List[dict] = []
-    per_class_match: dict = {}
+    annotations.sort(key=lambda a: int(a["position"]))
 
-    for class_idx, cls in enumerate(class_list):
-        cfg = class_configs.get(cls)
-        tol_s = cfg.tolerance_seconds if cfg else 1.0
-        delta = int(round(tol_s * fps))
-
-        gt_frames = np.where(targets[:, class_idx] == 1)[0].tolist()
-        gt_matched = [False] * len(gt_frames)
-
-        pred_frame_scores = []
-        for f in np.where(scores[:, class_idx] > 0)[0]:
-            score = float(scores[f, class_idx])
-            pred_frame_scores.append((int(f), score))
-            pred_events.append(
-                {
-                    "action": cls.name,
-                    "frame": int(f),
-                    "position_ms": int(f / fps * 1000),
-                    "confidence": score,
-                }
-            )
-        pred_frame_scores.sort(key=lambda x: -x[1])
-
-        tps: List[dict] = []
-        fps_list: List[dict] = []
-        for f, conf in pred_frame_scores:
-            best = -1
-            best_delta = float("inf")
-            for gi, gf in enumerate(gt_frames):
-                if not gt_matched[gi]:
-                    d = abs(f - gf)
-                    if d <= delta and d < best_delta:
-                        best = gi
-                        best_delta = d
-            if best >= 0:
-                gt_matched[best] = True
-                tps.append(
-                    {
-                        "pred_frame": f,
-                        "pred_position_ms": int(f / fps * 1000),
-                        "gt_frame": int(gt_frames[best]),
-                        "gt_position_ms": int(gt_frames[best] / fps * 1000),
-                        "delta_frames": int(abs(f - gt_frames[best])),
-                        "delta_ms": int(abs(f - gt_frames[best]) / fps * 1000),
-                        "confidence": conf,
-                    }
-                )
-            else:
-                fps_list.append(
-                    {
-                        "pred_frame": f,
-                        "pred_position_ms": int(f / fps * 1000),
-                        "confidence": conf,
-                    }
-                )
-
-        fns = [
-            {
-                "gt_frame": int(gt_frames[i]),
-                "gt_position_ms": int(gt_frames[i] / fps * 1000),
-            }
-            for i, m in enumerate(gt_matched)
-            if not m
-        ]
-
-        per_class_match[cls.name] = {
-            "tolerance_s": float(tol_s),
-            "gt_count": len(gt_frames),
-            "pred_count": len(pred_frame_scores),
-            "tp_count": len(tps),
-            "fp_count": len(fps_list),
-            "fn_count": len(fns),
-            "precision": (
-                float(len(tps)) / len(pred_frame_scores)
-                if pred_frame_scores
-                else 0.0
-            ),
-            "recall": (
-                float(len(tps)) / len(gt_frames) if gt_frames else 0.0
-            ),
-            "true_positives": tps,
-            "false_positives": fps_list[:max_fp_per_class],
-            "false_positives_truncated": len(fps_list) > max_fp_per_class,
-            "false_negatives": fns,
-        }
-
-    pred_events.sort(key=lambda e: (-e["confidence"], e["frame"]))
-
-    return {
-        "video_id": video.absolute_path,
-        "fps": float(fps),
-        "num_frames": num_frames,
-        "ground_truth_count": len(gt_events),
-        "prediction_count": len(pred_events),
-        "ground_truth": gt_events,
-        "predictions_top50": pred_events[:50],
-        "per_class": per_class_match,
-    }
+    return {"annotations": annotations}
 
 
 def _compute_per_class_ap(
@@ -1029,8 +934,8 @@ def _compute_per_class_ap(
 @click.option("--snms_window", type=int, default=12)
 @click.option("--snms_threshold", type=float, default=0.01)
 @click.option("--apply_min_score", type=bool, default=False)
-@click.option("--output_dir", type=str, default=None, help="If set, write per-video JSON results here.")
-@click.option("--max_fp_per_class", type=int, default=100)
+@click.option("--output_dir", type=str, default=None, help="If set, write per-video predictions JSON here (Labels-ball.json format).")
+@click.option("--min_confidence", type=float, default=0.0, help="Drop predictions below this confidence from the output JSON.")
 def evaluate_competition(
     val_dataset_path: str,
     model_checkpoint_path: str,
@@ -1050,7 +955,7 @@ def evaluate_competition(
     snms_threshold: float = 0.01,
     apply_min_score: bool = False,
     output_dir: str = None,
-    max_fp_per_class: int = 100,
+    min_confidence: float = 0.0,
 ):
     """Evaluate a competition model on a validation set with per-class AP.
 
@@ -1194,8 +1099,7 @@ def evaluate_competition(
                 video_json = _build_video_result_json(
                     vid_data=vid_data,
                     labels_enum=Action,
-                    class_configs=ACTION_CONFIGS,
-                    max_fp_per_class=max_fp_per_class,
+                    min_confidence=min_confidence,
                 )
             except Exception as e:
                 print(f"  [warn] failed to build JSON for {vid_data.video.absolute_path}: {e}")
