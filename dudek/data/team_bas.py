@@ -486,10 +486,10 @@ class SoccerVideo:
             for annotation in self.annotations:
                 if annotation.team != team:
                     continue
-                labels_matrix[
-                    annotation.get_frame_nr(fps=self.actual_fps),
-                    labels2int_map[annotation.label],
-                ] = 1
+                frame_nr = annotation.get_frame_nr(fps=self.actual_fps)
+                if frame_nr >= self.actual_n_frames or frame_nr < 0:
+                    continue
+                labels_matrix[frame_nr, labels2int_map[annotation.label]] = 1
 
         return labels_matrix if not no_background else labels_matrix[:, 1:]
 
@@ -508,10 +508,16 @@ class SoccerVideo:
                 label_idx = labels2int_map.get(annotation.label)
                 if label_idx is None:
                     continue
-                labels_matrix[
-                    annotation.get_frame_nr(fps=self.actual_fps),
-                    label_idx,
-                ] = 1
+                frame_nr = annotation.get_frame_nr(fps=self.actual_fps)
+                if frame_nr >= self.actual_n_frames or frame_nr < 0:
+                    print(
+                        f"[warn] annotation at frame {frame_nr} "
+                        f"(position={annotation.position}ms, label={annotation.label}) "
+                        f"is outside video ({self.actual_n_frames} frames) — skipping. "
+                        f"path={self.absolute_path}"
+                    )
+                    continue
+                labels_matrix[frame_nr, label_idx] = 1
 
         return labels_matrix if not no_background else labels_matrix[:, 1:]
 
