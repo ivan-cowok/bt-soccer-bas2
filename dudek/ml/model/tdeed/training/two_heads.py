@@ -220,6 +220,8 @@ def train(
                         foreground_weight=foreground_weight,
                         device=device,
                         per_class_weights=per_class_weights,
+                        epoch_nr=epoch_nr,
+                        summary_writer=summary_writer,
                     )
                     if eval_loss.total_loss < best_eval_metric:
                         best_eval_metric = eval_loss.total_loss
@@ -270,6 +272,8 @@ def _get_eval_loss(
     foreground_weight: int = 5,
     device=DEFAULT_DEVICE,
     per_class_weights=None,
+    epoch_nr: int = None,
+    summary_writer: SummaryWriter = None,
 ) -> TDeedLoss:
     epoch_loss_c, epoch_loss_d, ce_per_class = _go_through_epoch_eval(
         model,
@@ -278,6 +282,8 @@ def _get_eval_loss(
         foreground_weight=foreground_weight,
         device=device,
         per_class_weights=per_class_weights,
+        epoch_nr=epoch_nr,
+        summary_writer=summary_writer,
     )
     epoch_loss = epoch_loss_c.detach().item()
     epoch_loss += epoch_loss_d.detach().item()
@@ -333,6 +339,8 @@ def _go_through_epoch_eval(
     device: str = DEFAULT_DEVICE,
     loss_weights=None,
     per_class_weights=None,
+    epoch_nr: int = None,
+    summary_writer: SummaryWriter = None,
 ):
 
     return _go_through_epoch(
@@ -344,6 +352,8 @@ def _go_through_epoch_eval(
         device=device,
         loss_weights=loss_weights or [1.5, 1],
         per_class_weights=per_class_weights,
+        epoch_nr=epoch_nr,
+        summary_writer=summary_writer,
     )
 
 
