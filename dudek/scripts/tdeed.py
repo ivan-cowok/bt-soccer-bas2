@@ -931,8 +931,18 @@ def _compute_per_class_ap(
 @click.option("--tdeed_arch_sgp_k", type=int, default=4)
 @click.option("--gaussian_blur_kernel_size", type=int, default=5)
 @click.option("--use_snms", type=bool, default=True)
-@click.option("--snms_window", type=int, default=12)
+@click.option("--snms_window", type=int, default=12, help="Uniform SNMS window (frames). Ignored if --snms_windows is set.")
 @click.option("--snms_threshold", type=float, default=0.01)
+@click.option(
+    "--snms_windows",
+    type=str,
+    default=None,
+    help=(
+        "Per-class SNMS windows, comma-separated in Action enum order "
+        "(12 ints). Example: '50,50,50,50,50,75,75,50,50,50,75,75'. "
+        "Overrides --snms_window."
+    ),
+)
 @click.option("--apply_min_score", type=bool, default=False)
 @click.option("--output_dir", type=str, default=None, help="If set, write per-video predictions JSON here (Labels-ball.json format).")
 @click.option("--min_confidence", type=float, default=0.0, help="Drop predictions below this confidence from the output JSON.")
@@ -953,6 +963,7 @@ def evaluate_competition(
     use_snms: bool = True,
     snms_window: int = 12,
     snms_threshold: float = 0.01,
+    snms_windows: str = None,
     apply_min_score: bool = False,
     output_dir: str = None,
     min_confidence: float = 0.0,
@@ -1016,12 +1027,28 @@ def evaluate_competition(
         delta_frames_tolerance=1,
     )
 
+    if snms_windows is not None:
+        per_class = [int(x.strip()) for x in snms_windows.split(",") if x.strip()]
+        num_action_classes = len(Action)
+        assert len(per_class) == num_action_classes, (
+            f"--snms_windows has {len(per_class)} values, expected {num_action_classes} "
+            f"(one per Action class). Order: {[a.name for a in Action]}"
+        )
+        snms_class_window = per_class
+        print(
+            "Using per-class SNMS windows: "
+            + ", ".join(f"{a.name}={w}" for a, w in zip(Action, per_class))
+        )
+    else:
+        snms_class_window = snms_window
+        print(f"Using uniform SNMS window: {snms_window}")
+
     print("Running inference ...")
     scored_videos = evaluator.get_scored_videos(
         batch_size=val_batch_size,
         use_snms=use_snms,
         use_hflip=False,
-        snms_params=dict(class_window=snms_window, threshold=snms_threshold),
+        snms_params=dict(class_window=snms_class_window, threshold=snms_threshold),
     )
 
     print("Computing per-class AP ...")

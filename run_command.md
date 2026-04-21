@@ -76,3 +76,29 @@ uv run bas-frame-extract extract-bas-frames \
         --val_batch_size=2 \
         --use_snms=true \
         --output_dir=/workspace/bas/eval_results/
+
+uv run python -u dudek/scripts/tdeed.py evaluate-competition \
+    --val_dataset_path=/workspace/bas/data/competition_videos_challenge/ \
+    --model_checkpoint_path=/workspace/bas/bt-soccer-bas2/tdeed_competition_640_4.pt \
+    --clip_frames_count=170 \
+    --overlap=136 \
+    --val_batch_size=2 \
+    --use_snms=true \
+    --output_dir=/workspace/bas/eval_results/ \
+    --min_confidence=0.3
+
+# Per-class SNMS windows. Order MUST match Action enum:
+#   PASS, PASS_RECEIVED, RECOVERY, TACKLE, INTERCEPTION,
+#   BALL_OUT_OF_PLAY, CLEARANCE, AERIAL_DUEL, SHOT, SAVE, FOUL, GOAL
+# Baseline derived from w=12/25/50/75 sweep on competition_videos_val:
+#   - tight (50) for frequent / low-tolerance events (PASS family, TACKLE, SAVE)
+#   - wider (75) for sparse / high-tolerance events (BALL_OUT, CLEARANCE, GOAL)
+uv run python -u dudek/scripts/tdeed.py evaluate-competition \
+    --val_dataset_path=/workspace/bas/data/competition_videos_val/ \
+    --model_checkpoint_path=/workspace/bas/bt-soccer-bas2/tdeed_competition_640_4.pt \
+    --clip_frames_count=170 \
+    --overlap=136 \
+    --val_batch_size=2 \
+    --use_snms=true \
+    --snms_windows="50,50,50,50,50,75,75,50,50,50,50,75" \
+    --output_dir=/workspace/bas/sweep/per_class/
