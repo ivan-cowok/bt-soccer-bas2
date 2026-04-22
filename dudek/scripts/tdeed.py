@@ -24,6 +24,15 @@ from dudek.ml.model.tdeed.modules.tdeed import TDeedModule
 
 
 from dudek.ml.model.tdeed.training.two_heads import train as train_tdeed
+from dudek.utils.common import soft_non_maximum_suppression
+from dudek.utils.competition_score import (
+    COMPETITION_ACTIONS,
+    Event,
+    aggregate_final_scores,
+    load_all_gt_events,
+    score_class_on_video,
+    score_video,
+)
 from dudek.utils.video import load_action_spotting_videos, load_bas_videos, load_competition_videos
 
 import click
@@ -916,6 +925,248 @@ def _compute_per_class_ap(
     return results
 
 
+def _gt_labels_path_for_video(video) -> str:
+    """Labels-ball.json path for a SoccerVideo (same dir as the mp4)."""
+    return os.path.join(os.path.dirname(video.absolute_path), "Labels-ball.json")
+
+
+def _apply_single_class_snms(
+    raw_scores: np.ndarray,
+    class_idx: int,
+    window: int,
+    snms_threshold: float = 0.01,
+) -> np.ndarray:
+    """SNMS on a single class column. Replicates soft_non_maximum_suppression exactly
+    (greedy peak pick with quadratic-distance suppression) but without tqdm, so the
+    (class x window x video) sweep doesn't flood the logs with progress bars."""
+    s = raw_scores[:, class_idx].astype(np.float32, copy=True)
+    num_frames = s.shape[0]
+    window = int(window)
+    frames = np.arange(num_frames)
+    processed = np.zeros(num_frames, dtype=bool)
+    output_s = np.zeros(num_frames, dtype=np.float32)
+
+    while True:
+        s_masked = s.copy()
+        s_masked[processed] = -np.inf
+        e1_idx = int(np.argmax(s_masked))
+        e1_score = float(s_masked[e1_idx])
+        if e1_score < snms_threshold or e1_score == -np.inf:
+            break
+        output_s[e1_idx] = e1_score
+        processed[e1_idx] = True
+
+        distances = np.abs(frames - e1_idx)
+        within = (distances <= window) & (~processed)
+        if np.any(within):
+            suppression = (distances[within] ** 2) / (window ** 2)
+            s[within] = s[within] * suppression
+
+    return output_s
+
+
+def _class_events_from_post_snms(
+    post_snms_1d: np.ndarray,
+    class_label: str,
+    fps: float,
+    threshold: float,
+) -> List[Event]:
+    """Convert a post-SNMS 1-D score array into event predictions above threshold."""
+    frames = np.where(post_snms_1d > threshold)[0]
+    events: List[Event] = []
+    for f in frames:
+        conf = float(post_snms_1d[int(f)])
+        time_ms = int(int(f) / fps * 1000)
+        events.append(
+            Event(label=class_label, time_ms=time_ms, frame_nr=int(f), confidence=conf)
+        )
+    return events
+
+
+def _optimize_per_class_thresholds(
+    scored_videos,
+    video_gt_events: List[List[Event]],
+    labels_enum: Type[enum.Enum],
+    threshold_sweep: List[float],
+    snms_window_sweep: List[int],
+    snms_base_threshold: float = 0.01,
+) -> dict:
+    """For each trained class, sweep (snms_window, threshold) and find the combo that
+    maximises total class contribution (matched_points - fp_penalty) across videos.
+
+    Per-class independence holds under the competition scoring formula: a class's
+    matched_points / fp_penalty only depend on that class's predictions and GT.
+    The final-score clamp (max(0, raw)) only interacts when a video's other classes
+    are strongly negative; in practice most videos have positive raw score.
+
+    Returns a dict keyed by class name with the optimal setting and diagnostics.
+    """
+    class_list = list(labels_enum)
+    video_fps = [float(vd.video.metadata_fps) for vd in scored_videos]
+
+    results: dict = {}
+
+    for class_idx, cls in enumerate(tqdm(class_list, desc="Sweeping classes")):
+        class_label = cls.value  # e.g. "pass"
+        if class_label not in COMPETITION_ACTIONS:
+            # Shouldn't happen for Action enum but be safe.
+            continue
+
+        gt_count_total = sum(
+            sum(1 for e in gt if e.label == class_label) for gt in video_gt_events
+        )
+
+        # Track the grid of (window, threshold) -> contribution
+        best = {
+            "best_window": None,
+            "best_threshold": None,
+            "best_contribution": -float("inf"),
+            "matched_points": 0.0,
+            "fp_penalty": 0.0,
+            "n_matched": 0,
+            "n_fp": 0,
+            "n_gt": gt_count_total,
+            "tp_confidences": [],
+            "fp_confidences": [],
+            "grid": {},
+        }
+
+        for window in snms_window_sweep:
+            # Pre-compute post-SNMS for this class across all videos once per window.
+            post_snms_per_video: List[np.ndarray] = []
+            for vd in scored_videos:
+                post = _apply_single_class_snms(
+                    vd.scores, class_idx, window, snms_base_threshold
+                )
+                post_snms_per_video.append(post)
+
+            for thr in threshold_sweep:
+                total_matched = 0.0
+                total_fp_pen = 0.0
+                total_n_matched = 0
+                total_n_fp = 0
+                tp_confs: List[float] = []
+                fp_confs: List[float] = []
+
+                for v_idx, post in enumerate(post_snms_per_video):
+                    pred_events = _class_events_from_post_snms(
+                        post,
+                        class_label=class_label,
+                        fps=video_fps[v_idx],
+                        threshold=thr,
+                    )
+                    m_pts, fp_pen, n_m, n_fp, _ = score_class_on_video(
+                        video_gt_events[v_idx],
+                        pred_events,
+                        class_label=class_label,
+                    )
+                    total_matched += m_pts
+                    total_fp_pen += fp_pen
+                    total_n_matched += n_m
+                    total_n_fp += n_fp
+
+                    # Re-walk predictions to tag TP vs FP for confidence histograms.
+                    # (Re-match on this subset; same logic as score_class_on_video.)
+                    weight, tol_s = COMPETITION_ACTIONS[class_label]
+                    tol_ms = tol_s * 1000.0
+                    gt_of_class = [
+                        e for e in video_gt_events[v_idx] if e.label == class_label
+                    ]
+                    matched_pred_idx: set = set()
+                    for gt in gt_of_class:
+                        best_j, best_diff = None, float("inf")
+                        for j, pr in enumerate(pred_events):
+                            if j in matched_pred_idx:
+                                continue
+                            diff = abs(pr.time_ms - gt.time_ms)
+                            if diff <= tol_ms and diff < best_diff:
+                                best_j, best_diff = j, diff
+                        if best_j is not None:
+                            matched_pred_idx.add(best_j)
+                            tp_confs.append(pred_events[best_j].confidence or 0.0)
+                    for j, pr in enumerate(pred_events):
+                        if j not in matched_pred_idx:
+                            fp_confs.append(pr.confidence or 0.0)
+
+                contribution = total_matched - total_fp_pen
+                best["grid"][(int(window), float(thr))] = {
+                    "contribution": float(contribution),
+                    "matched_points": float(total_matched),
+                    "fp_penalty": float(total_fp_pen),
+                    "n_matched": int(total_n_matched),
+                    "n_fp": int(total_n_fp),
+                }
+                if contribution > best["best_contribution"]:
+                    best["best_contribution"] = float(contribution)
+                    best["best_window"] = int(window)
+                    best["best_threshold"] = float(thr)
+                    best["matched_points"] = float(total_matched)
+                    best["fp_penalty"] = float(total_fp_pen)
+                    best["n_matched"] = int(total_n_matched)
+                    best["n_fp"] = int(total_n_fp)
+                    best["tp_confidences"] = list(tp_confs)
+                    best["fp_confidences"] = list(fp_confs)
+
+        results[cls.name] = best
+
+    return results
+
+
+def _conf_percentiles(confidences: List[float]) -> dict:
+    if not confidences:
+        return {"n": 0, "p10": None, "p50": None, "p90": None, "min": None, "max": None}
+    arr = np.asarray(confidences, dtype=np.float32)
+    return {
+        "n": int(arr.size),
+        "p10": float(np.percentile(arr, 10)),
+        "p50": float(np.percentile(arr, 50)),
+        "p90": float(np.percentile(arr, 90)),
+        "min": float(arr.min()),
+        "max": float(arr.max()),
+    }
+
+
+def _score_videos_with_optimal(
+    scored_videos,
+    video_gt_events: List[List[Event]],
+    labels_enum: Type[enum.Enum],
+    optimal: dict,
+    snms_base_threshold: float = 0.01,
+) -> List[dict]:
+    """Apply each class's optimal (window, threshold) to build final predictions per
+    video and compute the competition score. Classes with non-positive best
+    contribution are dropped from submission."""
+    class_list = list(labels_enum)
+    per_video: List[dict] = []
+
+    for v_idx, vd in enumerate(scored_videos):
+        fps = float(vd.video.metadata_fps)
+        pred_events: List[Event] = []
+        for class_idx, cls in enumerate(class_list):
+            info = optimal.get(cls.name)
+            if info is None:
+                continue
+            if info["best_contribution"] <= 0.0:
+                continue  # DO NOT SUBMIT
+            post = _apply_single_class_snms(
+                vd.scores, class_idx, info["best_window"], snms_base_threshold
+            )
+            pred_events.extend(
+                _class_events_from_post_snms(
+                    post, class_label=cls.value, fps=fps, threshold=info["best_threshold"]
+                )
+            )
+        result = score_video(video_gt_events[v_idx], pred_events)
+        per_video.append(
+            {
+                "video_path": vd.video.absolute_path,
+                "result": result,
+                "n_pred": len(pred_events),
+            }
+        )
+    return per_video
+
+
 @cli.command()
 @click.option("--val_dataset_path", type=str, required=True)
 @click.option("--model_checkpoint_path", type=str, required=True)
@@ -946,6 +1197,28 @@ def _compute_per_class_ap(
 @click.option("--apply_min_score", type=bool, default=False)
 @click.option("--output_dir", type=str, default=None, help="If set, write per-video predictions JSON here (Labels-ball.json format).")
 @click.option("--min_confidence", type=float, default=0.0, help="Drop predictions below this confidence from the output JSON.")
+@click.option(
+    "--optimize_thresholds",
+    is_flag=True,
+    default=False,
+    help=(
+        "Sweep per-class (confidence threshold, SNMS window) to maximise total "
+        "competition score (score.py formula) on the validation set. Overrides "
+        "the mAP evaluation path and runs inference WITHOUT pre-applied SNMS."
+    ),
+)
+@click.option(
+    "--threshold_sweep",
+    type=str,
+    default="0.05,0.95,0.05",
+    help="Threshold sweep as start,stop,step (inclusive of start; stop is exclusive).",
+)
+@click.option(
+    "--snms_window_sweep",
+    type=str,
+    default="25,50,75,100",
+    help="Comma-separated list of SNMS window sizes to sweep over.",
+)
 def evaluate_competition(
     val_dataset_path: str,
     model_checkpoint_path: str,
@@ -967,6 +1240,9 @@ def evaluate_competition(
     apply_min_score: bool = False,
     output_dir: str = None,
     min_confidence: float = 0.0,
+    optimize_thresholds: bool = False,
+    threshold_sweep: str = "0.05,0.95,0.05",
+    snms_window_sweep: str = "25,50,75,100",
 ):
     """Evaluate a competition model on a validation set with per-class AP.
 
@@ -1026,6 +1302,190 @@ def evaluate_competition(
         dataset=val_dataset,
         delta_frames_tolerance=1,
     )
+
+    if optimize_thresholds:
+        # Inference WITHOUT SNMS: we sweep SNMS window per-class in post-processing.
+        print("Running inference (raw scores, no SNMS) for threshold optimization ...")
+        scored_videos = evaluator.get_scored_videos(
+            batch_size=val_batch_size,
+            use_snms=False,
+            use_hflip=False,
+            snms_params=None,
+        )
+
+        # Parse sweep configuration (inclusive of start AND stop when reachable).
+        try:
+            t_start, t_stop, t_step = [float(x) for x in threshold_sweep.split(",")]
+        except Exception as e:
+            raise click.BadParameter(
+                f"--threshold_sweep must be 'start,stop,step' floats; got '{threshold_sweep}'"
+            ) from e
+        thresholds: List[float] = []
+        t = t_start
+        while t <= t_stop + 1e-9:
+            thresholds.append(round(t, 6))
+            t += t_step
+        if not thresholds:
+            thresholds = [t_start]
+        windows: List[int] = [
+            int(x.strip()) for x in snms_window_sweep.split(",") if x.strip()
+        ]
+        if not windows:
+            raise click.BadParameter("--snms_window_sweep produced empty list")
+
+        print(
+            f"Threshold sweep: {len(thresholds)} values in [{thresholds[0]:.2f}, {thresholds[-1]:.2f}]; "
+            f"SNMS windows: {windows}"
+        )
+
+        # Load ALL-15-class GT per video for correct denominators.
+        print("Loading full 15-class GT per video ...")
+        video_gt_events: List[List[Event]] = []
+        for vd in scored_videos:
+            gt_path = _gt_labels_path_for_video(vd.video)
+            video_gt_events.append(load_all_gt_events(gt_path))
+
+        print("Sweeping per-class (SNMS window, threshold) ...")
+        optimal = _optimize_per_class_thresholds(
+            scored_videos=scored_videos,
+            video_gt_events=video_gt_events,
+            labels_enum=Action,
+            threshold_sweep=thresholds,
+            snms_window_sweep=windows,
+            snms_base_threshold=snms_threshold,
+        )
+
+        # Report per-class results.
+        print("")
+        print("=" * 110)
+        print(
+            f"{'Class':<18} {'w*':>4} {'thr*':>6} {'contrib':>10} "
+            f"{'matched':>9} {'FP_pen':>9} {'nM':>4} {'nFP':>5} {'nGT':>4} "
+            f"{'TPp50':>7} {'FPp50':>7} {'submit?':>8}"
+        )
+        print("-" * 110)
+        total_contribution = 0.0
+        for cls in Action:
+            info = optimal.get(cls.name)
+            if info is None:
+                continue
+            tp_stats = _conf_percentiles(info["tp_confidences"])
+            fp_stats = _conf_percentiles(info["fp_confidences"])
+            submit = info["best_contribution"] > 0.0
+            if submit:
+                total_contribution += info["best_contribution"]
+            tp_p50 = f"{tp_stats['p50']:.3f}" if tp_stats["p50"] is not None else "   -"
+            fp_p50 = f"{fp_stats['p50']:.3f}" if fp_stats["p50"] is not None else "   -"
+            print(
+                f"{cls.name:<18} "
+                f"{info['best_window']:>4} "
+                f"{info['best_threshold']:>6.2f} "
+                f"{info['best_contribution']:>10.2f} "
+                f"{info['matched_points']:>9.2f} "
+                f"{info['fp_penalty']:>9.2f} "
+                f"{info['n_matched']:>4d} "
+                f"{info['n_fp']:>5d} "
+                f"{info['n_gt']:>4d} "
+                f"{tp_p50:>7} "
+                f"{fp_p50:>7} "
+                f"{'YES' if submit else 'DROP':>8}"
+            )
+        print("-" * 110)
+
+        print("Scoring videos with optimal per-class (window, threshold) ...")
+        per_video = _score_videos_with_optimal(
+            scored_videos=scored_videos,
+            video_gt_events=video_gt_events,
+            labels_enum=Action,
+            optimal=optimal,
+            snms_base_threshold=snms_threshold,
+        )
+        agg = aggregate_final_scores([pv["result"] for pv in per_video])
+
+        print("")
+        print("=" * 110)
+        print(f"{'Video':<60} {'raw':>8} {'final':>8} {'n_pred':>7} {'n_gt':>5}")
+        print("-" * 110)
+        for pv in per_video:
+            r = pv["result"]
+            vid_name = os.path.basename(os.path.dirname(pv["video_path"]))
+            n_gt = sum(1 for _ in r.rows if _.kind in ("MATCH", "MISS"))
+            print(
+                f"{vid_name:<60} "
+                f"{r.raw_score:>8.4f} "
+                f"{r.final_score:>8.4f} "
+                f"{pv['n_pred']:>7d} "
+                f"{n_gt:>5d}"
+            )
+        print("-" * 110)
+        print(
+            f"Videos: {agg['n_videos']}  |  "
+            f"avg raw: {agg['avg_raw_score']:.4f}  |  "
+            f"avg final (clamped): {agg['avg_final_score']:.4f}  |  "
+            f"sum matched: {agg['sum_matched']:.2f}  |  "
+            f"sum FP penalty: {agg['sum_fp_penalty']:.2f}  |  "
+            f"sum GT weight: {agg['sum_gt_weight']:.2f}"
+        )
+        print("=" * 110)
+        print(
+            f"\n>>> COMPETITION SCORE (avg of per-video clamped finals): "
+            f"{agg['avg_final_score']*100:.2f}%  <<<"
+        )
+        print(f"    (current leader is at ~45%)")
+
+        # Optional: write per-video result JSONs to output_dir, plus a summary with
+        # the optimal parameters so we can re-use them.
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+            print(f"\nWriting optimized results to: {output_dir}")
+            opt_summary = {
+                "model_checkpoint": model_checkpoint_path,
+                "val_dataset_path": val_dataset_path,
+                "n_videos": agg["n_videos"],
+                "avg_final_score": agg["avg_final_score"],
+                "avg_raw_score": agg["avg_raw_score"],
+                "sum_matched": agg["sum_matched"],
+                "sum_fp_penalty": agg["sum_fp_penalty"],
+                "sum_gt_weight": agg["sum_gt_weight"],
+                "per_class": {
+                    cls.name: {
+                        "best_window": optimal[cls.name]["best_window"],
+                        "best_threshold": optimal[cls.name]["best_threshold"],
+                        "best_contribution": optimal[cls.name]["best_contribution"],
+                        "matched_points": optimal[cls.name]["matched_points"],
+                        "fp_penalty": optimal[cls.name]["fp_penalty"],
+                        "n_matched": optimal[cls.name]["n_matched"],
+                        "n_fp": optimal[cls.name]["n_fp"],
+                        "n_gt": optimal[cls.name]["n_gt"],
+                        "submit": optimal[cls.name]["best_contribution"] > 0.0,
+                        "tp_confidence_stats": _conf_percentiles(
+                            optimal[cls.name]["tp_confidences"]
+                        ),
+                        "fp_confidence_stats": _conf_percentiles(
+                            optimal[cls.name]["fp_confidences"]
+                        ),
+                    }
+                    for cls in Action
+                    if cls.name in optimal
+                },
+                "per_video": [
+                    {
+                        "video_path": pv["video_path"],
+                        "raw_score": pv["result"].raw_score,
+                        "final_score": pv["result"].final_score,
+                        "matched_score": pv["result"].matched_score,
+                        "fp_penalty": pv["result"].fp_penalty,
+                        "total_gt_weight": pv["result"].total_gt_weight,
+                        "n_pred": pv["n_pred"],
+                    }
+                    for pv in per_video
+                ],
+            }
+            with open(os.path.join(output_dir, "_optimization_summary.json"), "w") as f:
+                json.dump(opt_summary, f, indent=2)
+            print(f"Wrote _optimization_summary.json")
+
+        return optimal
 
     if snms_windows is not None:
         per_class = [int(x.strip()) for x in snms_windows.split(",") if x.strip()]

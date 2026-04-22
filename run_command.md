@@ -132,3 +132,31 @@ uv run python -u dudek/scripts/tdeed.py train-competition \
     --class_weight_cap=2.0 \
     --grad_checkpointing=true \
     --save_as=tdeed_competition_basinit_1.pt 2>&1 | tee "$LOG_FILE"
+
+
+##### Optimize per-class (SNMS window, confidence threshold) vs competition score
+#
+# Runs inference WITHOUT pre-applied SNMS, then sweeps:
+#   - SNMS window in {25, 50, 75, 100}
+#   - confidence threshold in [0.05, 0.95] step 0.05
+# per class, picking the combo that maximises total class contribution
+# (matched_points - fp_penalty) across val videos under the score.py formula.
+#
+# Output: per-class optimal (window, threshold), TP/FP confidence percentiles,
+# per-video raw/final scores, and the overall avg clamped final score (the
+# competition metric). Classes with non-positive best contribution are flagged
+# DROP (not submitted).
+#
+# Uses the full 15-class GT (including unsubmitted classes like clearance) for
+# the denominator, matching the real scoring behaviour.
+
+uv run python -u dudek/scripts/tdeed.py evaluate-competition \
+    --val_dataset_path=/workspace/bas/data/competition_videos_val/ \
+    --model_checkpoint_path=/workspace/bas/bt-soccer-bas2/tdeed_competition_640_4.pt \
+    --clip_frames_count=170 \
+    --overlap=136 \
+    --val_batch_size=2 \
+    --optimize_thresholds \
+    --threshold_sweep="0.05,0.95,0.05" \
+    --snms_window_sweep="25,50,75,100" \
+    --output_dir=/workspace/bas/sweep/competition_opt/
