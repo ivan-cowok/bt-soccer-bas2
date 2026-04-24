@@ -497,13 +497,17 @@ def _go_through_epoch(
                     # Focal loss: down-weight easy examples (high p_t).
                     # FL = -alpha_t * (1 - p_t)^gamma * log(p_t)
                     # Keep per-class alpha via class_weights; reduction=mean over samples.
+                    # label may be 1D class-idx or 2D one-hot/soft; normalise to 1D long.
+                    label_idx_long = (
+                        label.long() if label.dim() == 1 else label.argmax(dim=-1).long()
+                    )
                     log_probs = F.log_softmax(predictions.float(), dim=-1)
                     log_p_t = log_probs.gather(
-                        dim=-1, index=label.unsqueeze(-1)
+                        dim=-1, index=label_idx_long.unsqueeze(-1)
                     ).squeeze(-1)
                     p_t = log_p_t.exp().clamp(min=1e-8, max=1 - 1e-8)
                     focal_weight = (1.0 - p_t).pow(focal_loss_gamma)
-                    alpha_t = class_weights.gather(dim=-1, index=label)
+                    alpha_t = class_weights.gather(dim=-1, index=label_idx_long)
                     per_sample = -(alpha_t * focal_weight * log_p_t)
                     loss_c = loss_c + per_sample.mean().to(predictions.dtype)
                 else:
