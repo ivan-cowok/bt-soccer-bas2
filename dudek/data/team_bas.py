@@ -570,19 +570,40 @@ class SoccerVideo:
 
     @cached_property
     def _frame_nr_to_annotation_dict(self) -> Dict[int, Annotation]:
-        frame_nr_to_annotation_dict = {}
+        # Lazy import to avoid pulling the competition module at module load time.
+        from dudek.utils.competition_score import COMPETITION_ACTIONS
+
+        def _weight_of(ann: "Annotation") -> float:
+            label_value = ann.label.value if hasattr(ann.label, "value") else str(ann.label)
+            w_tol = COMPETITION_ACTIONS.get(label_value)
+            return w_tol[0] if w_tol is not None else 1.0
+
+        frame_nr_to_annotation_dict: Dict[int, Annotation] = {}
         if self.annotations:
             for annotation in self.annotations:
                 frame_nr = annotation.get_frame_nr(fps=self.metadata_fps)
-                if frame_nr not in frame_nr_to_annotation_dict:
+                existing = frame_nr_to_annotation_dict.get(frame_nr)
+                if existing is None:
                     frame_nr_to_annotation_dict[frame_nr] = annotation
+                    continue
+
+                # Collision: keep the higher-weight annotation (under the competition
+                # scoring weights). Ties keep the first one encountered.
+                ex_w = _weight_of(existing)
+                new_w = _weight_of(annotation)
+                if new_w > ex_w:
+                    kept, dropped = annotation, existing
                 else:
-                    existing = frame_nr_to_annotation_dict[frame_nr]
-                    raise ValueError(
-                        f"Two annotations map to the same frame {frame_nr}: "
-                        f"{existing.label} and {annotation.label}. "
-                        f"Ensure events are at least 1 frame apart (40ms at 25fps)."
-                    )
+                    kept, dropped = existing, annotation
+                frame_nr_to_annotation_dict[frame_nr] = kept
+                print(
+                    f"[warn] annotation collision at frame {frame_nr} "
+                    f"(video={getattr(self, 'absolute_path', '?')}): "
+                    f"keeping {kept.label} (weight={_weight_of(kept):.1f}, "
+                    f"pos={kept.position}ms), dropping {dropped.label} "
+                    f"(weight={_weight_of(dropped):.1f}, pos={dropped.position}ms). "
+                    f"Consider ≥80ms (2-frame) gap in labels."
+                )
         return frame_nr_to_annotation_dict
 
     @cached_property
