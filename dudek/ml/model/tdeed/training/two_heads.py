@@ -30,6 +30,13 @@ from dudek.ml.model.tdeed.eval.two_heads import BASTeamTDeedEvaluator
 from dudek.ml.model.tdeed.modules.tdeed import TDeedModule
 
 from dudek.utils.ml import get_lr_scheduler_with_warmup
+from dudek.utils.competition_score import (
+    Event,
+    aggregate_final_scores,
+    load_all_gt_events,
+    score_video,
+)
+from dudek.utils.common import soft_non_maximum_suppression
 
 
 @dataclasses.dataclass
@@ -62,9 +69,14 @@ def train(
     num_workers: int = 4,
     weight_decay: float = 0.0,
     backbone_lr_scale: float = 1.0,
+    focal_loss_gamma: float = 0.0,
+    comp_score_snms_window: int = 50,
+    comp_score_threshold: float = 0.5,
 ):
 
-    assert eval_metric in ["loss", "map"], "eval_metric must be loss or map"
+    assert eval_metric in ["loss", "map", "competition_score"], (
+        "eval_metric must be one of: loss, map, competition_score"
+    )
 
     # DDP setup: torchrun sets LOCAL_RANK; plain python leaves it unset (-1).
     _local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -151,6 +163,14 @@ def train(
             dataset=val_dataset,
             delta_frames_tolerance=5,
         )
+    elif eval_metric == "competition_score" and val_dataset is not None:
+        # Need scores per frame per class for post-processed matching.
+        val_dataset.return_dict = False
+        evaluator = BASTeamTDeedEvaluator(
+            model=model,
+            dataset=val_dataset,
+            delta_frames_tolerance=1,
+        )
 
     if _is_main:
         hparam_dict = {
@@ -207,6 +227,7 @@ def train(
             loss_weights=loss_weights or [1.5, 1],
             is_main=_is_main,
             per_class_weights=per_class_weights,
+            focal_loss_gamma=focal_loss_gamma,
         )
 
         if _is_main and val_dataset is not None:
@@ -222,6 +243,7 @@ def train(
                         per_class_weights=per_class_weights,
                         epoch_nr=epoch_nr,
                         summary_writer=summary_writer,
+                        focal_loss_gamma=focal_loss_gamma,
                     )
                     if eval_loss.total_loss < best_eval_metric:
                         best_eval_metric = eval_loss.total_loss
@@ -260,6 +282,41 @@ def train(
                             maps["mAP"],
                             epoch_nr,
                         )
+                elif eval_metric == "competition_score":
+                    comp = _eval_competition_score(
+                        evaluator=evaluator,
+                        labels_enum=labels_enum,
+                        val_batch_size=val_batch_size,
+                        snms_window=comp_score_snms_window,
+                        threshold=comp_score_threshold,
+                        epoch_nr=epoch_nr,
+                    )
+                    if comp["avg_final_score"] > best_eval_metric:
+                        best_eval_metric = comp["avg_final_score"]
+                        if save_as:
+                            torch.save(raw_model.state_dict(), save_as)
+
+                    summary_writer.add_scalar(
+                        "eval/competition_score",
+                        comp["avg_final_score"],
+                        epoch_nr,
+                    )
+                    summary_writer.add_scalar(
+                        "eval/competition_raw_score",
+                        comp["avg_raw_score"],
+                        epoch_nr,
+                    )
+                    for cls_name, pc in comp.get("per_class", {}).items():
+                        summary_writer.add_scalar(
+                            f"eval_comp_per_class_matched/{cls_name}",
+                            pc.get("matched_points", 0.0),
+                            epoch_nr,
+                        )
+                        summary_writer.add_scalar(
+                            f"eval_comp_per_class_fp/{cls_name}",
+                            pc.get("fp_penalty", 0.0),
+                            epoch_nr,
+                        )
 
                 model.train()
     return raw_model
@@ -274,6 +331,7 @@ def _get_eval_loss(
     per_class_weights=None,
     epoch_nr: int = None,
     summary_writer: SummaryWriter = None,
+    focal_loss_gamma: float = 0.0,
 ) -> TDeedLoss:
     epoch_loss_c, epoch_loss_d, ce_per_class = _go_through_epoch_eval(
         model,
@@ -284,6 +342,7 @@ def _get_eval_loss(
         per_class_weights=per_class_weights,
         epoch_nr=epoch_nr,
         summary_writer=summary_writer,
+        focal_loss_gamma=focal_loss_gamma,
     )
     epoch_loss = epoch_loss_c.detach().item()
     epoch_loss += epoch_loss_d.detach().item()
@@ -311,6 +370,7 @@ def _go_through_epoch_train(
     loss_weights=None,
     is_main: bool = True,
     per_class_weights=None,
+    focal_loss_gamma: float = 0.0,
 ):
     return _go_through_epoch(
         model=model,
@@ -328,6 +388,7 @@ def _go_through_epoch_train(
         loss_weights=loss_weights or [1.5, 1],
         is_main=is_main,
         per_class_weights=per_class_weights,
+        focal_loss_gamma=focal_loss_gamma,
     )
 
 
@@ -341,6 +402,7 @@ def _go_through_epoch_eval(
     per_class_weights=None,
     epoch_nr: int = None,
     summary_writer: SummaryWriter = None,
+    focal_loss_gamma: float = 0.0,
 ):
 
     return _go_through_epoch(
@@ -354,6 +416,7 @@ def _go_through_epoch_eval(
         per_class_weights=per_class_weights,
         epoch_nr=epoch_nr,
         summary_writer=summary_writer,
+        focal_loss_gamma=focal_loss_gamma,
     )
 
 
@@ -373,6 +436,7 @@ def _go_through_epoch(
     loss_weights=None,
     is_main: bool = True,
     per_class_weights=None,
+    focal_loss_gamma: float = 0.0,
 ):
     loss_weights = loss_weights or [1.5, 1]
     if not evaluate:
@@ -429,7 +493,21 @@ def _go_through_epoch(
                 loss_c = 0.0
 
                 predictions = pred.reshape(-1, len(labels_enum) + 1)
-                loss_c += F.cross_entropy(predictions, label, weight=class_weights)
+                if focal_loss_gamma > 0.0:
+                    # Focal loss: down-weight easy examples (high p_t).
+                    # FL = -alpha_t * (1 - p_t)^gamma * log(p_t)
+                    # Keep per-class alpha via class_weights; reduction=mean over samples.
+                    log_probs = F.log_softmax(predictions.float(), dim=-1)
+                    log_p_t = log_probs.gather(
+                        dim=-1, index=label.unsqueeze(-1)
+                    ).squeeze(-1)
+                    p_t = log_p_t.exp().clamp(min=1e-8, max=1 - 1e-8)
+                    focal_weight = (1.0 - p_t).pow(focal_loss_gamma)
+                    alpha_t = class_weights.gather(dim=-1, index=label)
+                    per_sample = -(alpha_t * focal_weight * log_p_t)
+                    loss_c = loss_c + per_sample.mean().to(predictions.dtype)
+                else:
+                    loss_c += F.cross_entropy(predictions, label, weight=class_weights)
 
                 loss += loss_c * loss_weights[0]
 
@@ -530,6 +608,102 @@ def _go_through_epoch(
                 )
 
     return epoch_loss_c, epoch_loss_d, ce_per_class
+
+
+def _eval_competition_score(
+    evaluator: BASTeamTDeedEvaluator,
+    labels_enum: Type[BASLabel | ActionLabel],
+    val_batch_size: int,
+    snms_window: int = 50,
+    threshold: float = 0.5,
+    epoch_nr: Optional[int] = None,
+) -> dict:
+    """Run full-video inference, convert scores -> events using fixed SNMS + threshold,
+    then score each video against its Labels-ball.json ground truth and return the
+    aggregate competition score.
+
+    Returns dict with: avg_final_score, avg_raw_score, per_class {matched_points, fp_penalty}.
+    """
+    import numpy as np
+
+    scored_videos = evaluator.get_scored_videos(
+        batch_size=val_batch_size,
+        use_snms=False,
+        use_hflip=False,
+        snms_params=None,
+    )
+
+    class_list = list(labels_enum)
+    per_video_results = []
+    per_class_agg: dict = {}
+
+    for vd in scored_videos:
+        scores = vd.scores  # (n_frames, n_classes)
+        # SNMS turns raw per-frame scores into sparse "peak" scores (non-peak frames = 0)
+        post = soft_non_maximum_suppression(
+            scores, class_window=snms_window, threshold=0.01
+        )
+        fps = float(vd.video.metadata_fps)
+
+        pred_events: list[Event] = []
+        for class_idx, cls in enumerate(class_list):
+            col = post[:, class_idx]
+            frames = np.where(col > threshold)[0]
+            for f in frames:
+                pred_events.append(
+                    Event(
+                        label=cls.value,
+                        time_ms=int(f / fps * 1000),
+                        frame_nr=int(f),
+                        confidence=float(col[f]),
+                    )
+                )
+
+        gt_path = os.path.join(
+            os.path.dirname(vd.video.absolute_path), "Labels-ball.json"
+        )
+        gt_events = load_all_gt_events(gt_path)
+        result = score_video(gt_events, pred_events)
+        per_video_results.append(result)
+
+        for cls_name, pc in result.per_class.items():
+            agg = per_class_agg.setdefault(
+                cls_name, {"matched_points": 0.0, "fp_penalty": 0.0, "n_matched": 0, "n_fp": 0, "n_gt": 0}
+            )
+            for k in ("matched_points", "fp_penalty", "n_matched", "n_fp", "n_gt"):
+                agg[k] += pc.get(k, 0)
+
+    agg_final = aggregate_final_scores(per_video_results)
+    if epoch_nr is not None:
+        print(
+            f"[eval epoch {epoch_nr}] competition_score "
+            f"(snms_window={snms_window}, threshold={threshold:.2f}): "
+            f"avg_final={agg_final['avg_final_score']:.4f}  "
+            f"avg_raw={agg_final['avg_raw_score']:.4f}  "
+            f"matched_sum={agg_final['sum_matched']:.1f}  "
+            f"fp_sum={agg_final['sum_fp_penalty']:.1f}  "
+            f"gt_weight_sum={agg_final['sum_gt_weight']:.1f}"
+        )
+        if per_class_agg:
+            print(f"[eval epoch {epoch_nr}] competition per-class:")
+            for cls in labels_enum:
+                pc = per_class_agg.get(cls.value, {})
+                m = pc.get("matched_points", 0.0)
+                fp = pc.get("fp_penalty", 0.0)
+                n_gt = int(pc.get("n_gt", 0))
+                n_m = int(pc.get("n_matched", 0))
+                n_fp = int(pc.get("n_fp", 0))
+                contribution = m - fp
+                print(
+                    f"    {cls.name:<20s} match={n_m}/{n_gt}  fp={n_fp}  "
+                    f"+pts={m:6.2f}  -pen={fp:6.2f}  net={contribution:+7.2f}"
+                )
+
+    return {
+        "avg_final_score": agg_final["avg_final_score"],
+        "avg_raw_score": agg_final["avg_raw_score"],
+        "per_class": per_class_agg,
+    }
 
 
 def _optim_step(scaler, optimizer, scheduler, loss, backward_only=False):

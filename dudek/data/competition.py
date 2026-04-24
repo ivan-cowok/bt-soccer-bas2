@@ -15,6 +15,7 @@ class Action(str, enum.Enum):
     TACKLE = "tackle"
     INTERCEPTION = "interception"
     BALL_OUT_OF_PLAY = "ball_out_of_play"
+    BLOCK = "block"
     AERIAL_DUEL = "aerial_duel"
     SHOT = "shot"
     SAVE = "save"
@@ -29,6 +30,7 @@ ACTION_CONFIGS: dict[Action, ActionConfig] = {
     Action.TACKLE: ActionConfig(2.5, 0.1, 1.5),
     Action.INTERCEPTION: ActionConfig(2.8, 0.5, 2.0),
     Action.BALL_OUT_OF_PLAY: ActionConfig(2.9, 0.5, 2.0),
+    Action.BLOCK: ActionConfig(4.2, 0.5, 2.0),
     Action.AERIAL_DUEL: ActionConfig(4.3, 0.5, 2.0),
     Action.SHOT: ActionConfig(4.7, 0.5, 2.0),
     Action.SAVE: ActionConfig(7.3, 0.5, 2.0),

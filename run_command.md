@@ -1,3 +1,109 @@
+# =============================================================================
+# NEW 12-CLASS SCHEMA (clearance removed, block added)
+#   Action enum order:
+#   PASS, PASS_RECEIVED, RECOVERY, TACKLE, INTERCEPTION,
+#   BALL_OUT_OF_PLAY, BLOCK, AERIAL_DUEL, SHOT, SAVE, FOUL, GOAL
+#
+# All videos are now 25fps and labels match. Finetune from tdeed_best.pt
+# (BAS-finetuned checkpoint, 7-class head — head is re-initialised to 12
+# classes by load_backbone() which only loads _features + _temp_fine).
+# =============================================================================
+
+
+# -------- Step 1: extract 640x360 frames (stride=1, all frames) --------
+#
+# NOTE on --resolution: this is the filename suffix of the source video
+# ({resolution}p.mp4, e.g. 224p.mp4). It is NOT pixel size. The actual
+# extracted JPG size is controlled by --frame_target_width/--frame_target_height.
+# Keep --resolution matching what your video files are named on disk
+# (e.g. 224p.mp4 -> --resolution=224).
+
+uv run python dudek/scripts/extract.py extract-competition-frames \
+    --dataset_path=/workspace/bas/data/competition_videos/ \
+    --resolution=224 \
+    --stride=1 \
+    --frame_target_width=640 \
+    --frame_target_height=360 \
+    --num_workers=8
+
+uv run python dudek/scripts/extract.py extract-competition-frames \
+    --dataset_path=/workspace/bas/data/competition_videos_val/ \
+    --resolution=224 \
+    --stride=1 \
+    --frame_target_width=640 \
+    --frame_target_height=360 \
+    --num_workers=8
+
+
+# -------- Step 2: finetune from tdeed_best.pt with Focal Loss + competition_score --------
+#
+# Key changes vs prior run:
+#   --eval_metric=competition_score  → saves best checkpoint by avg clamped
+#       competition score (FP-penalty aware), not CE loss or mAP.
+#   --focal_loss_gamma=2.0           → focuses training on hard examples,
+#       helps rare classes (GOAL, FOUL, SAVE, BLOCK, AERIAL_DUEL).
+#   --comp_score_threshold=0.5       → fixed threshold used only to compute
+#       the per-epoch competition score for checkpoint selection. Real
+#       per-class optimal thresholds are found post-training via
+#       evaluate-competition --optimize_thresholds.
+#   --comp_score_snms_window=50      → single fixed SNMS window for the same.
+#
+# class_weight_cap=2.0 still applies with inverse_sqrt; combined with focal
+# loss this gives a strong but bounded push on rare classes.
+
+mkdir -p /workspace/bas/logs && \
+LOG_FILE=/workspace/bas/logs/train_focal_$(date +%Y%m%d_%H%M%S).log && \
+echo "Logging to: $LOG_FILE" && \
+uv run python -u dudek/scripts/tdeed.py train-competition \
+    --dataset_path=/workspace/bas/data/competition_videos/ \
+    --val_dataset_path=/workspace/bas/data/competition_videos_val/ \
+    --model_checkpoint_path=/workspace/bas/bt-soccer-bas2/tdeed_best.pt \
+    --clip_frames_count=170 \
+    --overlap=136 \
+    --nr_epochs=30 \
+    --learning_rate=0.00005 \
+    --train_batch_size=2 \
+    --val_batch_size=2 \
+    --acc_grad_iter=4 \
+    --num_workers=12 \
+    --flip_proba=0.3 \
+    --crop_proba=0.2 \
+    --camera_move_proba=0.2 \
+    --even_choice_proba=0.2 \
+    --loss_foreground_weight=5 \
+    --backbone_lr_scale=0.1 \
+    --weight_decay=0.05 \
+    --class_weight_mode=inverse_sqrt \
+    --class_weight_cap=2.0 \
+    --grad_checkpointing=true \
+    --focal_loss_gamma=2.0 \
+    --eval_metric=competition_score \
+    --start_eval_epoch_nr=3 \
+    --comp_score_snms_window=50 \
+    --comp_score_threshold=0.5 \
+    --save_as=tdeed_competition_focal_1.pt 2>&1 | tee "$LOG_FILE"
+
+
+# -------- Step 3: post-training per-class threshold & SNMS-window sweep --------
+# Uses the full 15-class GT weight for the denominator (matches real scoring).
+
+uv run python -u dudek/scripts/tdeed.py evaluate-competition \
+    --val_dataset_path=/workspace/bas/data/competition_videos_val/ \
+    --model_checkpoint_path=/workspace/bas/bt-soccer-bas2/tdeed_competition_focal_1.pt \
+    --clip_frames_count=170 \
+    --overlap=136 \
+    --val_batch_size=2 \
+    --optimize_thresholds \
+    --threshold_sweep="0.05,0.95,0.05" \
+    --snms_window_sweep="25,50,75,100" \
+    --output_dir=/workspace/bas/sweep/focal_opt/
+
+
+# =============================================================================
+# LEGACY COMMANDS (kept for reference, 11-class schema, pre-fix data)
+# =============================================================================
+
+
 torchrun --nproc_per_node=2 dudek/scripts/tdeed.py train \
     --dataset_path=/workspace/bas/data/bas_videos/ \
     --model_checkpoint_path=/workspace/bas/bt-soccer-bas2/pretrained.pt \
@@ -87,20 +193,20 @@ uv run python -u dudek/scripts/tdeed.py evaluate-competition \
     --output_dir=/workspace/bas/eval_results/ \
     --min_confidence=0.3
 
-# Per-class SNMS windows. Order MUST match Action enum (11 classes, CLEARANCE dropped):
+# Per-class SNMS windows. Order MUST match Action enum (12 classes, new schema):
 #   PASS, PASS_RECEIVED, RECOVERY, TACKLE, INTERCEPTION,
-#   BALL_OUT_OF_PLAY, AERIAL_DUEL, SHOT, SAVE, FOUL, GOAL
-# Baseline derived from w=12/25/50/75 sweep on competition_videos_val:
-#   - tight (50) for frequent / low-tolerance events (PASS family, TACKLE, SAVE)
-#   - wider (75) for sparse / high-tolerance events (BALL_OUT, GOAL)
+#   BALL_OUT_OF_PLAY, BLOCK, AERIAL_DUEL, SHOT, SAVE, FOUL, GOAL
+# Baseline:
+#   - tight (50) for frequent / low-tolerance events (PASS family, TACKLE)
+#   - wider (75) for sparse / high-tolerance events (BALL_OUT_OF_PLAY, GOAL)
 uv run python -u dudek/scripts/tdeed.py evaluate-competition \
     --val_dataset_path=/workspace/bas/data/competition_videos_val/ \
-    --model_checkpoint_path=/workspace/bas/bt-soccer-bas2/tdeed_competition_640_4.pt \
+    --model_checkpoint_path=/workspace/bas/bt-soccer-bas2/tdeed_competition_focal_1.pt \
     --clip_frames_count=170 \
     --overlap=136 \
     --val_batch_size=2 \
     --use_snms=true \
-    --snms_windows="50,50,50,50,50,75,50,50,50,50,75" \
+    --snms_windows="50,50,50,50,50,75,50,50,50,50,50,75" \
     --output_dir=/workspace/bas/sweep/per_class/
 
 

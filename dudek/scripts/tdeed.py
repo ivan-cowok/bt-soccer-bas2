@@ -622,6 +622,24 @@ def create_solution(
 @click.option("--class_weight_mode", type=click.Choice(["none", "inverse_sqrt"]), default="none")
 @click.option("--class_weight_cap", type=float, default=3.0)
 @click.option("--grad_checkpointing", type=bool, default=False)
+@click.option(
+    "--focal_loss_gamma",
+    type=float,
+    default=0.0,
+    help="If > 0, use Focal Loss with this gamma (typical: 2.0). 0 = regular CE.",
+)
+@click.option(
+    "--comp_score_snms_window",
+    type=int,
+    default=50,
+    help="SNMS window (frames) used when eval_metric=competition_score.",
+)
+@click.option(
+    "--comp_score_threshold",
+    type=float,
+    default=0.5,
+    help="Confidence threshold used when eval_metric=competition_score.",
+)
 def train_competition(
     dataset_path: str,
     resolution: int = 224,
@@ -663,8 +681,18 @@ def train_competition(
     class_weight_mode: str = "none",
     class_weight_cap: float = 3.0,
     grad_checkpointing: bool = False,
+    focal_loss_gamma: float = 0.0,
+    comp_score_snms_window: int = 50,
+    comp_score_threshold: float = 0.5,
 ):
     assert resolution in [224, 720]
+    assert eval_metric in ["loss", "map", "competition_score"], (
+        "eval_metric must be loss, map, or competition_score"
+    )
+    if eval_metric == "competition_score":
+        assert val_dataset_path is not None, (
+            "eval_metric=competition_score requires --val_dataset_path (Labels-ball.json GT)."
+        )
     if use_wandb:
         wandb.init(project=experiment_name, sync_tensorboard=True)
 
@@ -722,7 +750,7 @@ def train_competition(
     if enforce_val_epoch_size is not None:
         val_dataset.enforced_epoch_size = enforce_val_epoch_size
 
-    if eval_metric == "map":
+    if eval_metric in ("map", "competition_score"):
         val_dataset.return_dict = False
     val_dataset.flip_proba = 0.0
     val_dataset.camera_move_proba = 0.0
@@ -781,6 +809,9 @@ def train_competition(
         num_workers=num_workers,
         weight_decay=weight_decay,
         backbone_lr_scale=0.0 if freeze_backbone else backbone_lr_scale,
+        focal_loss_gamma=focal_loss_gamma,
+        comp_score_snms_window=comp_score_snms_window,
+        comp_score_threshold=comp_score_threshold,
     )
 
 
