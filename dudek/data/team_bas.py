@@ -139,8 +139,12 @@ class Annotation:
                             team = Team.RIGHT if np.random.rand() > 0.5 else Team.LEFT
                         try:
                             label = enum_class(label_json["label"])
-                        except ValueError:
-                            continue
+                        except ValueError as exc:
+                            raise ValueError(
+                                f"Unknown label {label_json['label']!r} in {labels_path} "
+                                f"for enum {enum_class.__name__}. "
+                                f"Filter it out from the data or add it to the enum."
+                            ) from exc
                         labels.append(
                             Annotation(
                                 label=label,

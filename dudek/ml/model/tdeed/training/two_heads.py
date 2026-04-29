@@ -63,6 +63,7 @@ def train(
     acc_grad_iter: int = 1,
     warm_up_epochs: int = 1,
     save_as: Optional[str] = "best.pt",
+    save_every_epoch: bool = False,
     lr: float = 0.0004,
     loss_weights=None,
     per_class_weights=None,
@@ -319,6 +320,11 @@ def train(
                         )
 
                 model.train()
+
+        if _is_main and save_as and save_every_epoch:
+            epoch_path = f"{save_as}.epoch_{epoch_nr}.pt"
+            torch.save(raw_model.state_dict(), epoch_path)
+            print(f"Saved per-epoch checkpoint: {epoch_path}")
     return raw_model
 
 

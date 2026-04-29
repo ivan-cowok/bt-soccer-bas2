@@ -640,6 +640,12 @@ def create_solution(
     default=0.5,
     help="Confidence threshold used when eval_metric=competition_score.",
 )
+@click.option(
+    "--save_every_epoch",
+    type=bool,
+    default=False,
+    help="If true, save a per-epoch checkpoint as {save_as}.epoch_{N}.pt in addition to the best one.",
+)
 def train_competition(
     dataset_path: str,
     resolution: int = 224,
@@ -684,6 +690,7 @@ def train_competition(
     focal_loss_gamma: float = 0.0,
     comp_score_snms_window: int = 50,
     comp_score_threshold: float = 0.5,
+    save_every_epoch: bool = False,
 ):
     assert resolution in [224, 720]
     assert eval_metric in ["loss", "map", "competition_score"], (
@@ -802,6 +809,7 @@ def train_competition(
         device=DEFAULT_DEVICE,
         acc_grad_iter=acc_grad_iter,
         save_as=save_as,
+        save_every_epoch=save_every_epoch,
         lr=learning_rate,
         loss_weights=[1.5, 1],
         warm_up_epochs=warm_up_epochs,
