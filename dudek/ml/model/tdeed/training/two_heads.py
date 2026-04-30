@@ -73,6 +73,8 @@ def train(
     focal_loss_gamma: float = 0.0,
     comp_score_snms_window: int = 50,
     comp_score_threshold: float = 0.5,
+    use_bf16: bool = False,
+    seq_freeze_epochs: int = 0,
 ):
 
     assert eval_metric in ["loss", "map", "competition_score"], (
@@ -93,6 +95,36 @@ def train(
 
     model.to(device)
 
+    # Phase 1 of the sequence-decoder warm-start: optionally freeze backbone
+    # + SGP for the first ``seq_freeze_epochs`` epochs so the randomly-
+    # initialised sequence decoder (and the per-frame heads) settle without
+    # their gradients flowing back through and corrupting the BAS-pretrained
+    # ``_features`` / ``_temp_fine`` weights. After phase 1 the optimizer is
+    # rebuilt to include the unfrozen modules and the model is re-wrapped in
+    # DDP so the reducer's bucket layout matches the new requires_grad set.
+    #
+    # IMPORTANT: freezing must happen BEFORE the DDP wrap. DDP captures the
+    # set of params requiring gradients at construction time; toggling
+    # requires_grad after the wrap leads to the reducer waiting for
+    # gradients that never arrive (or vice versa).
+    has_seq_decoder = getattr(model, "_seq_decoder", None) is not None
+    if seq_freeze_epochs > 0:
+        if not has_seq_decoder and _is_main:
+            print(
+                f"NOTE: --seq_freeze_epochs={seq_freeze_epochs} requested but "
+                "the model has no sequence decoder; freezing backbone + SGP "
+                "anyway, but you probably want use_seq_decoder=True."
+            )
+        model.freeze_backbone()
+        model.freeze_sgp()
+        if _is_main:
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in model.parameters())
+            print(
+                f"[warm-start phase 1] backbone + SGP frozen for "
+                f"{seq_freeze_epochs} epoch(s). Trainable: {trainable:,} / {total:,}"
+            )
+
     if _is_ddp:
         model = DDP(model, device_ids=[_local_rank], output_device=_local_rank)
         if _is_main:
@@ -104,27 +136,17 @@ def train(
         )
 
     raw_model = model.module if isinstance(model, DDP) else model
-    backbone_lr = lr * backbone_lr_scale
-    param_groups = [
-        {
-            "params": [p for p in raw_model._features.parameters() if p.requires_grad],
-            "lr": backbone_lr,
-        },
-        {
-            "params": [
-                p for name, p in raw_model.named_parameters()
-                if not name.startswith("_features") and p.requires_grad
-            ],
-            "lr": lr,
-        },
-    ]
-    optimizer = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
-    if _is_main:
-        print(
-            f"Optimizer: backbone_lr={backbone_lr:.2e}  "
-            f"head_lr={lr:.2e}  weight_decay={weight_decay}"
-        )
-    scaler = torch.amp.GradScaler("cuda") if "cuda" in device else None
+
+    # bf16 has the same dynamic range as fp32, so GradScaler is only required
+    # for fp16 (where small gradients underflow to zero). On Blackwell-class
+    # GPUs (RTX 5090 / H100) bf16 is also faster for attention / softmax,
+    # which matters once the SequenceTransformerHead is enabled.
+    autocast_dtype = torch.bfloat16 if use_bf16 else torch.float16
+    scaler = (
+        None
+        if use_bf16
+        else (torch.amp.GradScaler("cuda") if "cuda" in device else None)
+    )
 
     if _is_ddp:
         train_sampler = torch.utils.data.DistributedSampler(train_dataset, shuffle=True)
@@ -148,13 +170,52 @@ def train(
             persistent_workers=num_workers > 0,
         )
 
-    optimizer_steps_per_epoch = len(train_data_loader) // acc_grad_iter
+    optimizer_steps_per_epoch = max(len(train_data_loader) // acc_grad_iter, 1)
 
-    scheduler = get_lr_scheduler_with_warmup(
-        optimizer,
-        warm_up_steps=optimizer_steps_per_epoch * warm_up_epochs,
-        total_training_steps=(nr_epochs - warm_up_epochs) * optimizer_steps_per_epoch,
-    )
+    def _build_optimizer_and_scheduler(epochs_remaining: int):
+        """(Re)build optimizer + scheduler over currently-trainable params.
+
+        Used at start, and again when leaving the freeze phase to bring
+        backbone + SGP back into the optimizer. Optimizer momentum state is
+        intentionally reset on rebuild — the post-freeze backbone has been
+        idle for ``seq_freeze_epochs`` and we want a clean curve from there.
+        """
+        backbone_lr = lr * backbone_lr_scale
+        param_groups = [
+            {
+                "params": [
+                    p for p in raw_model._features.parameters() if p.requires_grad
+                ],
+                "lr": backbone_lr,
+            },
+            {
+                "params": [
+                    p
+                    for name, p in raw_model.named_parameters()
+                    if not name.startswith("_features") and p.requires_grad
+                ],
+                "lr": lr,
+            },
+        ]
+        # Drop empty groups (e.g. backbone group is empty during phase 1).
+        param_groups = [g for g in param_groups if len(g["params"]) > 0]
+        opt = torch.optim.AdamW(param_groups, weight_decay=weight_decay)
+        sch = get_lr_scheduler_with_warmup(
+            opt,
+            warm_up_steps=optimizer_steps_per_epoch * warm_up_epochs,
+            total_training_steps=max(epochs_remaining - warm_up_epochs, 1)
+            * optimizer_steps_per_epoch,
+        )
+        if _is_main:
+            n_back = sum(g["params"][0].numel() for g in param_groups[:1]) if param_groups else 0
+            print(
+                f"Optimizer: backbone_lr={backbone_lr:.2e}  "
+                f"head_lr={lr:.2e}  weight_decay={weight_decay}  "
+                f"groups={len(param_groups)} (backbone params in opt: {n_back > 0})"
+            )
+        return opt, sch
+
+    optimizer, scheduler = _build_optimizer_and_scheduler(nr_epochs)
 
     best_eval_metric = float("inf") if eval_metric == "loss" else 0.0
     evaluator = None
@@ -213,6 +274,35 @@ def train(
         if train_sampler is not None:
             train_sampler.set_epoch(epoch_nr)
 
+        # End of phase 1 (freeze): unfreeze backbone + SGP, re-wrap DDP so
+        # the reducer picks up the newly-trainable params, and rebuild the
+        # optimizer / scheduler. We do this at the *start* of epoch
+        # ``seq_freeze_epochs`` so that this is the first epoch where
+        # backbone + SGP gradients flow.
+        if seq_freeze_epochs > 0 and epoch_nr == seq_freeze_epochs:
+            raw_model.unfreeze_backbone()
+            raw_model.unfreeze_sgp()
+            if _is_ddp:
+                # Rebuild DDP because reducer buckets were built when backbone
+                # + SGP had requires_grad=False; they are not in the reducer.
+                model = DDP(
+                    raw_model,
+                    device_ids=[_local_rank],
+                    output_device=_local_rank,
+                )
+                raw_model = model.module
+            epochs_remaining = nr_epochs - epoch_nr
+            optimizer, scheduler = _build_optimizer_and_scheduler(epochs_remaining)
+            if _is_main:
+                trainable = sum(
+                    p.numel() for p in raw_model.parameters() if p.requires_grad
+                )
+                total = sum(p.numel() for p in raw_model.parameters())
+                print(
+                    f"[warm-start phase 2] epoch {epoch_nr}: backbone + SGP "
+                    f"unfrozen. Trainable: {trainable:,} / {total:,}"
+                )
+
         _go_through_epoch_train(
             model=model,
             labels_enum=labels_enum,
@@ -229,6 +319,7 @@ def train(
             is_main=_is_main,
             per_class_weights=per_class_weights,
             focal_loss_gamma=focal_loss_gamma,
+            autocast_dtype=autocast_dtype,
         )
 
         if _is_main and val_dataset is not None:
@@ -245,6 +336,7 @@ def train(
                         epoch_nr=epoch_nr,
                         summary_writer=summary_writer,
                         focal_loss_gamma=focal_loss_gamma,
+                        autocast_dtype=autocast_dtype,
                     )
                     if eval_loss.total_loss < best_eval_metric:
                         best_eval_metric = eval_loss.total_loss
@@ -338,6 +430,7 @@ def _get_eval_loss(
     epoch_nr: int = None,
     summary_writer: SummaryWriter = None,
     focal_loss_gamma: float = 0.0,
+    autocast_dtype: torch.dtype = torch.float16,
 ) -> TDeedLoss:
     epoch_loss_c, epoch_loss_d, ce_per_class = _go_through_epoch_eval(
         model,
@@ -349,6 +442,7 @@ def _get_eval_loss(
         epoch_nr=epoch_nr,
         summary_writer=summary_writer,
         focal_loss_gamma=focal_loss_gamma,
+        autocast_dtype=autocast_dtype,
     )
     epoch_loss = epoch_loss_c.detach().item()
     epoch_loss += epoch_loss_d.detach().item()
@@ -377,6 +471,7 @@ def _go_through_epoch_train(
     is_main: bool = True,
     per_class_weights=None,
     focal_loss_gamma: float = 0.0,
+    autocast_dtype: torch.dtype = torch.float16,
 ):
     return _go_through_epoch(
         model=model,
@@ -395,6 +490,7 @@ def _go_through_epoch_train(
         is_main=is_main,
         per_class_weights=per_class_weights,
         focal_loss_gamma=focal_loss_gamma,
+        autocast_dtype=autocast_dtype,
     )
 
 
@@ -409,6 +505,7 @@ def _go_through_epoch_eval(
     epoch_nr: int = None,
     summary_writer: SummaryWriter = None,
     focal_loss_gamma: float = 0.0,
+    autocast_dtype: torch.dtype = torch.float16,
 ):
 
     return _go_through_epoch(
@@ -423,6 +520,7 @@ def _go_through_epoch_eval(
         epoch_nr=epoch_nr,
         summary_writer=summary_writer,
         focal_loss_gamma=focal_loss_gamma,
+        autocast_dtype=autocast_dtype,
     )
 
 
@@ -443,6 +541,7 @@ def _go_through_epoch(
     is_main: bool = True,
     per_class_weights=None,
     focal_loss_gamma: float = 0.0,
+    autocast_dtype: torch.dtype = torch.float16,
 ):
     loss_weights = loss_weights or [1.5, 1]
     if not evaluate:
@@ -487,7 +586,7 @@ def _go_through_epoch(
                 else label.view(-1, label.shape[-1])
             )
 
-            with torch.amp.autocast(device_type=_amp_device_type):
+            with torch.amp.autocast(device_type=_amp_device_type, dtype=autocast_dtype):
                 pred_dict, y = model(clip_tensor, y=label, inference=evaluate)
 
                 pred = pred_dict["im_feat"]

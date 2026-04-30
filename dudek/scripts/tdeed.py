@@ -646,6 +646,28 @@ def create_solution(
     default=False,
     help="If true, save a per-epoch checkpoint as {save_as}.epoch_{N}.pt in addition to the best one.",
 )
+@click.option(
+    "--use_seq_decoder",
+    type=bool,
+    default=False,
+    help="If true, stack a Transformer encoder on top of the SGP head. Recommended for v4+ to capture long-range event dependencies (PASS->PASS_RECEIVED at 5-25 frames, RECOVERY's diverse predecessors).",
+)
+@click.option("--seq_decoder_layers", type=int, default=2)
+@click.option("--seq_decoder_heads", type=int, default=8)
+@click.option("--seq_decoder_ff_mult", type=int, default=4)
+@click.option("--seq_decoder_dropout", type=float, default=0.1)
+@click.option(
+    "--use_bf16",
+    type=bool,
+    default=False,
+    help="If true, use bfloat16 mixed precision instead of fp16. Recommended for the sequence decoder (attention/softmax are sensitive to fp16 underflow). Required for Blackwell-class GPUs (RTX 5090, H100) for best speed. Disables GradScaler since bf16 has fp32-equivalent dynamic range.",
+)
+@click.option(
+    "--seq_freeze_epochs",
+    type=int,
+    default=0,
+    help="Number of epochs to freeze backbone + SGP at the start of training. Lets the randomly-initialised sequence decoder settle before its gradients flow back into the BAS-pretrained weights. 0 disables the warm-start (rely on LR warmup only). Typical: 2-3 with use_seq_decoder=True.",
+)
 def train_competition(
     dataset_path: str,
     resolution: int = 224,
@@ -691,6 +713,13 @@ def train_competition(
     comp_score_snms_window: int = 50,
     comp_score_threshold: float = 0.5,
     save_every_epoch: bool = False,
+    use_seq_decoder: bool = False,
+    seq_decoder_layers: int = 2,
+    seq_decoder_heads: int = 8,
+    seq_decoder_ff_mult: int = 4,
+    seq_decoder_dropout: float = 0.1,
+    use_bf16: bool = False,
+    seq_freeze_epochs: int = 0,
 ):
     assert resolution in [224, 720]
     assert eval_metric in ["loss", "map", "competition_score"], (
@@ -785,6 +814,11 @@ def train_competition(
         temporal_shift_mode=temporal_shift_mode,
         gaussian_blur_ks=gaussian_blur_kernel_size,
         grad_checkpointing=grad_checkpointing,
+        use_seq_decoder=use_seq_decoder,
+        seq_decoder_layers=seq_decoder_layers,
+        seq_decoder_heads=seq_decoder_heads,
+        seq_decoder_ff_mult=seq_decoder_ff_mult,
+        seq_decoder_dropout=seq_decoder_dropout,
     )
     if model_checkpoint_path:
         tdeed_model.load_backbone(model_weight_path=model_checkpoint_path)
@@ -820,6 +854,8 @@ def train_competition(
         focal_loss_gamma=focal_loss_gamma,
         comp_score_snms_window=comp_score_snms_window,
         comp_score_threshold=comp_score_threshold,
+        use_bf16=use_bf16,
+        seq_freeze_epochs=seq_freeze_epochs,
     )
 
 
@@ -1258,6 +1294,16 @@ def _score_videos_with_optimal(
     default="25,50,75,100",
     help="Comma-separated list of SNMS window sizes to sweep over.",
 )
+@click.option(
+    "--use_seq_decoder",
+    type=bool,
+    default=False,
+    help="Must match the value used during training. v4+ checkpoints have a sequence decoder; legacy v3/v3.5 checkpoints do not.",
+)
+@click.option("--seq_decoder_layers", type=int, default=2)
+@click.option("--seq_decoder_heads", type=int, default=8)
+@click.option("--seq_decoder_ff_mult", type=int, default=4)
+@click.option("--seq_decoder_dropout", type=float, default=0.1)
 def evaluate_competition(
     val_dataset_path: str,
     model_checkpoint_path: str,
@@ -1282,6 +1328,11 @@ def evaluate_competition(
     optimize_thresholds: bool = False,
     threshold_sweep: str = "0.05,0.95,0.05",
     snms_window_sweep: str = "25,50,75,100",
+    use_seq_decoder: bool = False,
+    seq_decoder_layers: int = 2,
+    seq_decoder_heads: int = 8,
+    seq_decoder_ff_mult: int = 4,
+    seq_decoder_dropout: float = 0.1,
 ):
     """Evaluate a competition model on a validation set with per-class AP.
 
@@ -1330,6 +1381,11 @@ def evaluate_competition(
         features_model_name=features_model_name,
         temporal_shift_mode=temporal_shift_mode,
         gaussian_blur_ks=gaussian_blur_kernel_size,
+        use_seq_decoder=use_seq_decoder,
+        seq_decoder_layers=seq_decoder_layers,
+        seq_decoder_heads=seq_decoder_heads,
+        seq_decoder_ff_mult=seq_decoder_ff_mult,
+        seq_decoder_dropout=seq_decoder_dropout,
     )
     print(f"Loading weights from {model_checkpoint_path} ...")
     tdeed_model.load_all(model_weight_path=model_checkpoint_path)

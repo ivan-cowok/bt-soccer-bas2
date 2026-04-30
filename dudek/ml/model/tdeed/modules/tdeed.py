@@ -46,6 +46,78 @@ class AddGaussianNoise(nn.Module):
         return (x + noise).clamp_(0.0, 1.0)
 
 
+class SequenceTransformerHead(nn.Module):
+    """Bidirectional Transformer encoder stacked on top of TDEED's SGP head.
+
+    Why this exists:
+      SGP (EDSGPMIXERLayers) is a *local* multi-scale temporal CNN. Its
+      effective receptive field per frame is on the order of a few-to-tens of
+      frames. Several of our event chains have *variable, longer-range*
+      temporal dependencies that SGP cannot resolve:
+        - PASS_RECEIVED requires a recent PASS at distance 5-25 frames.
+        - RECOVERY's predecessors (SHOT / AERIAL_DUEL / failed PASS / BOOP
+          aftermath) sit 5-50 frames back.
+        - Stoppage context after BALL_OUT_OF_PLAY suppresses ~50 frames.
+
+      A small Transformer encoder over the full clip lets every frame attend
+      to every other frame. SGP keeps doing what it is good at (local multi-
+      scale features) and the encoder adds the long-range reasoning on top.
+      This is the standard "CNN backbone + Transformer head" pattern (DETR,
+      ViT-Det, Action Transformer).
+
+    Design notes:
+      - Stacked, NOT replacing SGP. Replacing would throw away the BAS-
+        pretrained SGP weights inside ``tdeed_best.pt`` and lose TDEED's
+        proven local temporal capability.
+      - Pre-LN (``norm_first=True``): more stable when training the
+        randomly-initialised head from scratch on top of pretrained features.
+      - Learned positional encoding: clip length is fixed (e.g. 170), the
+        cost is ~clip_len * d_model parameters which is negligible.
+      - Output dim matches input dim so downstream classifier and
+        displacement heads stay unchanged.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        clip_len: int,
+        n_layers: int = 2,
+        n_heads: int = 8,
+        dim_feedforward_mult: int = 4,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.clip_len = clip_len
+
+        self.pos_enc = nn.Parameter(torch.zeros(1, clip_len, d_model))
+        nn.init.trunc_normal_(self.pos_enc, std=0.02)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=n_heads,
+            dim_feedforward=d_model * dim_feedforward_mult,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.out_norm = nn.LayerNorm(d_model)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, T, D]
+        if x.shape[1] != self.clip_len:
+            raise ValueError(
+                f"SequenceTransformerHead got T={x.shape[1]} but was built for "
+                f"clip_len={self.clip_len}. Positional encoding length mismatch."
+            )
+        x = x + self.pos_enc
+        x = self.encoder(x)
+        x = self.out_norm(x)
+        return x
+
+
 class TDeedModule(nn.Module):
 
     def __init__(
@@ -59,6 +131,11 @@ class TDeedModule(nn.Module):
         temporal_shift_mode: str = "gsf",
         gaussian_blur_ks: int = 3,
         grad_checkpointing: bool = False,
+        use_seq_decoder: bool = False,
+        seq_decoder_layers: int = 2,
+        seq_decoder_heads: int = 8,
+        seq_decoder_ff_mult: int = 4,
+        seq_decoder_dropout: float = 0.1,
     ):
         super().__init__()
 
@@ -68,6 +145,11 @@ class TDeedModule(nn.Module):
         self.sgp_ks = sgp_ks
         self.n_layers = n_layers
         self.grad_checkpointing = grad_checkpointing
+        self.use_seq_decoder = use_seq_decoder
+        self.seq_decoder_layers = seq_decoder_layers
+        self.seq_decoder_heads = seq_decoder_heads
+        self.seq_decoder_ff_mult = seq_decoder_ff_mult
+        self.seq_decoder_dropout = seq_decoder_dropout
 
         features = timm.create_model(
             features_model_name,
@@ -100,6 +182,20 @@ class TDeedModule(nn.Module):
             k=sgp_k,
             concat=True,
         )
+        # Optional sequence decoder stacked between SGP and the per-frame
+        # heads. Off by default for backward compatibility with v3 / v3.5
+        # checkpoints (which lack ``_seq_decoder.*`` keys).
+        if use_seq_decoder:
+            self._seq_decoder = SequenceTransformerHead(
+                d_model=self._feat_dim,
+                clip_len=clip_len,
+                n_layers=seq_decoder_layers,
+                n_heads=seq_decoder_heads,
+                dim_feedforward_mult=seq_decoder_ff_mult,
+                dropout=seq_decoder_dropout,
+            )
+        else:
+            self._seq_decoder = None
         self._pred_fine = FCLayers(self._feat_dim, num_classes + 1)
         self._pred_displ = FCLayers(self._feat_dim, 1)
 
@@ -188,6 +284,9 @@ class TDeedModule(nn.Module):
         output_data = {}
         im_feat = self._temp_fine(im_feat)
 
+        if self._seq_decoder is not None:
+            im_feat = self._seq_decoder(im_feat)
+
         displ_feat = self._pred_displ(im_feat).squeeze(-1)
         output_data["displ_feat"] = displ_feat
 
@@ -237,6 +336,28 @@ class TDeedModule(nn.Module):
 
     def unfreeze_backbone(self):
         for param in self._features.parameters():
+            param.requires_grad = True
+
+    def freeze_sgp(self):
+        for param in self._temp_fine.parameters():
+            param.requires_grad = False
+        self.temp_enc.requires_grad = False
+
+    def unfreeze_sgp(self):
+        for param in self._temp_fine.parameters():
+            param.requires_grad = True
+        self.temp_enc.requires_grad = True
+
+    def freeze_seq_decoder(self):
+        if self._seq_decoder is None:
+            return
+        for param in self._seq_decoder.parameters():
+            param.requires_grad = False
+
+    def unfreeze_seq_decoder(self):
+        if self._seq_decoder is None:
+            return
+        for param in self._seq_decoder.parameters():
             param.requires_grad = True
 
     def load_all(self, model_weight_path: str):
