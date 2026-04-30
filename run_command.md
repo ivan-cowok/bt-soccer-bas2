@@ -319,6 +319,93 @@ uv run python -u dudek/scripts/tdeed.py train-competition \
     --save_as=tdeed_competition_focal_v3.pt 2>&1 | tee "$LOG_FILE"
 
 
+##### v3.5 baseline: v3 + augmentation cleanup
+#
+# Augmentation changes vs v3:
+#   - camera_move_proba: 0.2 -> 0.0
+#       Real cameras in our footage are mostly fixed (slow human-pan only when
+#       ball goes long). The current sinusoidal warp augmentation injects
+#       motion that does not occur at test time and adds zero-padding
+#       artifacts at frame edges. Removing it.
+#   - gaussian_blur_kernel_size: 5 -> 3
+#       Plus the model code now caps GaussianBlur sigma at (0.3, 1.0) (was the
+#       torchvision default (0.1, 2.0) which is destructive on a 6-10 px ball
+#       at 640x360).
+#   - NEW: AddGaussianNoise (per-frame independent noise, sigma per clip
+#       0.0 - 0.03 in [0,1] units, p=0.20). Simulates sensor / snow / low-quality
+#       grain present in our footage. Implemented in
+#       dudek/ml/model/tdeed/modules/tdeed.py and wired into the model's
+#       augmentation pipeline (no CLI knob; tweak the source if needed).
+#   - NEW: RandomErasing (same box across all frames in a clip via v2's per-
+#       call param sampling, scale=(0.005, 0.03), p=0.15, value=0). Simulates
+#       player / observer / object occlusions. Forces the model to use temporal
+#       context and player-action cues instead of ball-only shortcuts. Expected
+#       to most help PASS_RECEIVED / AERIAL_DUEL / SHOT FP rates (the classes
+#       currently over-relying on ball-pixel patterns). No CLI knob.
+#   - ColorJitter ranges tuned to our domain (no CLI knobs):
+#         hue:        0.10        -> 0.05         (tighter; ±10% hue rotation
+#                                                 made grass purple-ish.)
+#         saturation: (0.7, 1.2)  -> (0.5, 1.3)   (wider; snow matches need
+#                                                 low end, daylight high end.)
+#         brightness: (0.7, 1.2)  -> (0.6, 1.3)   (wider; cover snow + evening.)
+#         contrast:   (0.7, 1.2)  -> (0.8, 1.15)  (tighter; low contrast on
+#                                                 cheap footage erases ball-
+#                                                 vs-grass detail.)
+#   - flip_proba: 0.3 -> 0.5
+#       Soccer is left/right symmetric for our task (PASS/PASS_RECEIVED/etc.
+#       look identical mirrored). 0.5 is the standard for symmetric vision
+#       tasks; 0.3 was the unexamined inherited choice. Note: the dataset
+#       code (dudek/ml/data/tdeed.py) was also patched so flip is now clamped
+#       at 0.5 inside the even_choice doubling block (otherwise rare-event
+#       clips would always be flipped, losing orientation diversity).
+#   - displacement: 4 -> 3
+#       The ±4 edge frames are visually the most ambiguous (foot approaching
+#       or leaving ball, ball mid-flight) and contribute to the model firing
+#       PASS-family classes liberally on neutral-looking frames at inference.
+#       Tightening to ±3 removes those edge frames. With our gap=2 minimum
+#       between adjacent events, each event in an adjacent pair still gets
+#       4-5 labeled frames (vs 5-6 at d=4) — plenty of training signal given
+#       1000s of events per common class. Expected modest FP reduction on
+#       PASS / PASS_RECEIVED.
+#
+# Everything else identical to v3 so we can attribute changes to the
+# augmentation cleanup alone.
+mkdir -p /workspace/bas/logs && \
+LOG_FILE=/workspace/bas/logs/train_focal_v35_$(date +%Y%m%d_%H%M%S).log && \
+echo "Logging to: $LOG_FILE" && \
+uv run python -u dudek/scripts/tdeed.py train-competition \
+    --dataset_path=/workspace/bas/data/competition_videos/ \
+    --val_dataset_path=/workspace/bas/data/competition_videos_val/ \
+    --model_checkpoint_path=/workspace/bas/bt-soccer-bas2/tdeed_best.pt \
+    --clip_frames_count=170 \
+    --overlap=136 \
+    --nr_epochs=25 \
+    --learning_rate=0.00005 \
+    --train_batch_size=2 \
+    --val_batch_size=2 \
+    --acc_grad_iter=4 \
+    --num_workers=12 \
+    --flip_proba=0.5 \
+    --crop_proba=0.2 \
+    --camera_move_proba=0.0 \
+    --even_choice_proba=0.4 \
+    --loss_foreground_weight=5 \
+    --backbone_lr_scale=0.1 \
+    --weight_decay=0.05 \
+    --class_weight_mode=inverse_sqrt \
+    --class_weight_cap=3.0 \
+    --grad_checkpointing=true \
+    --gaussian_blur_kernel_size=3 \
+    --displacement=3 \
+    --focal_loss_gamma=1.0 \
+    --eval_metric=competition_score \
+    --comp_score_snms_window=50 \
+    --comp_score_threshold=0.30 \
+    --start_eval_epoch_nr=2 \
+    --save_every_epoch=true \
+    --save_as=tdeed_competition_focal_v35.pt 2>&1 | tee "$LOG_FILE"
+
+
 ##### v3: post-training per-class threshold sweep (run on all epoch ckpts)
 # Loop epoch checkpoints and pick the best per the optimize_thresholds output.
 for CKPT in /workspace/bas/bt-soccer-bas2/tdeed_competition_focal_v3.pt.epoch_*.pt; do

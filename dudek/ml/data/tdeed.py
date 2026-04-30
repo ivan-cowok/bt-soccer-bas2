@@ -220,10 +220,16 @@ class TeamTDeedDataset(Dataset):
                 random_label = random.choice(list(self.clip_ids_by_label.keys()))
                 label_idxs = self.clip_ids_by_label[random_label]
                 idx = random.choice(label_idxs)
+                # Flip is binary-symmetric: doubling past 0.5 starts losing
+                # orientation diversity (at 1.0 every clip is flipped, so the
+                # rare-event clips would never be seen in their original
+                # orientation). Clamp flip at 0.5 even when even_choice fires.
+                # crop and camera_move are intensity-graded, so doubling them
+                # genuinely produces more variety — leave those uncapped.
                 bas_tdeed_video_clip = TdeedVideoClip.from_video_clip(
                     self.clips[idx],
                     self.displacement,
-                    flip_proba=self.flip_proba * 2,
+                    flip_proba=min(self.flip_proba * 2, 0.5),
                     camera_movement_proba=self.camera_move_proba * 2,
                     crop_proba=self.crop_proba * 2,
                     labels_enum=self.labels_enum,

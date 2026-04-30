@@ -21,6 +21,31 @@ class TDeedLoss:
     bce_loss_teams: float
 
 
+class AddGaussianNoise(nn.Module):
+    """Per-frame additive Gaussian noise.
+
+    Sigma is sampled once per call (i.e. once per clip) so that the noise
+    *level* is constant across the clip — that matches what a single recording
+    looks like (sensor noise level depends on the camera/lighting, not the
+    instant). The noise tensor itself is independent for every frame, every
+    pixel, every channel — sensor noise / snow grain decorrelates across
+    frames.
+
+    Expects input in [0.0, 1.0].
+    """
+
+    def __init__(self, sigma_range: tuple[float, float] = (0.0, 0.03)):
+        super().__init__()
+        self.sigma_min, self.sigma_max = sigma_range
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        sigma = random.uniform(self.sigma_min, self.sigma_max)
+        if sigma <= 0.0:
+            return x
+        noise = torch.randn_like(x) * sigma
+        return (x + noise).clamp_(0.0, 1.0)
+
+
 class TDeedModule(nn.Module):
 
     def __init__(
@@ -78,14 +103,50 @@ class TDeedModule(nn.Module):
         self._pred_fine = FCLayers(self._feat_dim, num_classes + 1)
         self._pred_displ = FCLayers(self._feat_dim, 1)
 
-        # Augmentations
+        # Augmentations.
+        #
+        # Notes:
+        #  * GaussianBlur sigma capped at 1.0 — at our 640x360 resolution a
+        #    6-10 px ball survives sigma <= 1.0 but loses contrast badly above.
+        #    Default torchvision sigma range is (0.1, 2.0) which is destructive
+        #    for small balls; (0.3, 1.0) is the safer band for our domain.
+        #  * RandomErasing simulates real-world occlusions (player walking past
+        #    the ball, defender between camera and ball, sideline observer).
+        #    Same box across all frames in a clip via v2's per-call param
+        #    sampling. scale=(0.005, 0.03) keeps boxes small (0.5-3% of frame
+        #    area, ≈30x40 to 110x100 px at 640x360) — large enough to be
+        #    realistic, small enough that erasing the ball is a low-probability
+        #    event (~0.2% of training frames). Forces the model to use temporal
+        #    context and player-action cues instead of ball-only shortcuts.
+        #  * AddGaussianNoise simulates sensor / snow / low-quality grain that
+        #    appears in our footage. Independent noise per frame, sigma fixed
+        #    per clip. Applied last so it is independent of color/blur.
+        # ColorJitter ranges tuned for our domain (low-league, fixed wide camera,
+        # high real-world photometric variability — snow, daylight, evening,
+        # children's matches, mismatched broadcast quality):
+        #   - hue=0.05 (tightened from 0.1): real white-balance variation is
+        #     small; ±10% hue rotation makes grass purple-ish, which is
+        #     unphysical and wastes capacity.
+        #   - saturation=(0.5, 1.3) (widened): snow matches need the low end,
+        #     saturated daylight needs the high end.
+        #   - brightness=(0.6, 1.3) (widened): snow is very bright, evening is
+        #     dark; need both tails covered.
+        #   - contrast=(0.8, 1.15) (tightened): low contrast on already-low-
+        #     quality footage erases ball-vs-grass detail. Safer to narrow.
         self.augmentation = T.Compose(
             [
-                T.RandomApply([T.ColorJitter(hue=0.1)], p=0.25),
-                T.RandomApply([T.ColorJitter(saturation=(0.7, 1.2))], p=0.25),
-                T.RandomApply([T.ColorJitter(brightness=(0.7, 1.2))], p=0.25),
-                T.RandomApply([T.ColorJitter(contrast=(0.7, 1.2))], p=0.25),
-                T.RandomApply([T.GaussianBlur(gaussian_blur_ks)], p=0.25),
+                T.RandomApply([T.ColorJitter(hue=0.05)], p=0.25),
+                T.RandomApply([T.ColorJitter(saturation=(0.5, 1.3))], p=0.25),
+                T.RandomApply([T.ColorJitter(brightness=(0.6, 1.3))], p=0.25),
+                T.RandomApply([T.ColorJitter(contrast=(0.8, 1.15))], p=0.25),
+                T.RandomApply(
+                    [T.GaussianBlur(kernel_size=gaussian_blur_ks, sigma=(0.3, 1.0))],
+                    p=0.20,
+                ),
+                T.RandomErasing(
+                    p=0.15, scale=(0.005, 0.03), ratio=(0.3, 3.3), value=0
+                ),
+                T.RandomApply([AddGaussianNoise(sigma_range=(0.0, 0.03))], p=0.20),
             ]
         )
 
