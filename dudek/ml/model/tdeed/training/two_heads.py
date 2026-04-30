@@ -153,6 +153,11 @@ def train(
     else:
         train_sampler = None
 
+    # NOTE: prefetch_factor=1 (default is 2) to keep host RAM bounded at 540p.
+    # Each worker holds (prefetch_factor) batches in flight; with 24 workers
+    # across 4 ranks at 170-frame 540p clips, prefetch_factor=2 alone costs
+    # ~25 GB host RAM. 1 is the minimum legal value when num_workers > 0.
+    _loader_extra = {"prefetch_factor": 1} if num_workers > 0 else {}
     train_data_loader = DataLoader(
         train_dataset,
         batch_size=train_batch_size,
@@ -161,6 +166,7 @@ def train(
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=num_workers > 0,
+        **_loader_extra,
     )
     if val_dataset is not None:
         eval_data_loader = DataLoader(
@@ -168,6 +174,7 @@ def train(
             num_workers=num_workers,
             pin_memory=True,
             persistent_workers=num_workers > 0,
+            **_loader_extra,
         )
 
     optimizer_steps_per_epoch = max(len(train_data_loader) // acc_grad_iter, 1)

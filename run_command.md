@@ -504,21 +504,24 @@ uv run python dudek/scripts/extract.py extract-competition-frames \
 
 
 # -------- Step 2: train v4 on 4x RTX 5090 via DDP --------
-mkdir -p /workspace/bas/logs && \
-LOG_FILE=/workspace/bas/logs/train_v4_$(date +%Y%m%d_%H%M%S).log && \
+# IMPORTANT:
+#  - run via `uv run` so worker processes use the project .venv (deps installed by `uv sync`).
+#  - export PYTHONPATH=. so worker processes can `import dudek`.
+mkdir -p /workspace/44/logs && \
+LOG_FILE=/workspace/44/logs/train_v4_$(date +%Y%m%d_%H%M%S).log && \
 echo "Logging to: $LOG_FILE" && \
-torchrun --nproc_per_node=4 dudek/scripts/tdeed.py train-competition \
-    --dataset_path=/workspace/bas/data/competition_videos/ \
-    --val_dataset_path=/workspace/bas/data/competition_videos_val/ \
-    --model_checkpoint_path=/workspace/bas/bt-soccer-bas2/tdeed_best.pt \
+PYTHONPATH=. uv run torchrun --nproc_per_node=4 dudek/scripts/tdeed.py train-competition \
+    --dataset_path=/workspace/44/data/competition_videos/ \
+    --val_dataset_path=/workspace/44/data/competition_videos_val/ \
+    --model_checkpoint_path=/workspace/44/bt-soccer-bas2/tdeed_best.pt \
     --clip_frames_count=170 \
     --overlap=136 \
-    --nr_epochs=20 \
+    --nr_epochs=25 \
     --learning_rate=0.00005 \
     --train_batch_size=1 \
     --val_batch_size=1 \
     --acc_grad_iter=2 \
-    --num_workers=6 \
+    --num_workers=12 \
     --flip_proba=0.5 \
     --crop_proba=0.2 \
     --camera_move_proba=0.0 \
