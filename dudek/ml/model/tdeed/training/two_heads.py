@@ -3,6 +3,7 @@ import enum
 import json
 import os
 import time
+from datetime import timedelta
 from typing import Type, Optional
 
 import torch
@@ -75,6 +76,7 @@ def train(
     comp_score_threshold: float = 0.5,
     use_bf16: bool = False,
     seq_freeze_epochs: int = 0,
+    max_train_iter_per_epoch: Optional[int] = None,
 ):
 
     assert eval_metric in ["loss", "map", "competition_score"], (
@@ -87,7 +89,17 @@ def train(
 
     if _is_ddp:
         if not dist.is_initialized():
-            dist.init_process_group(backend="nccl")
+            # IMPORTANT: bump NCCL collective timeout to 2 hours.
+            # Reason: competition_score evaluation runs on rank 0 only
+            # (per-video sliding-window inference) and can take 30-60 minutes
+            # for the full val set. Other ranks block at the next training
+            # epoch's allreduce while rank 0 is busy. The default 10-minute
+            # NCCL timeout fires and kills the run. 2 hours gives ample
+            # margin for slow eval epochs without masking real hangs.
+            dist.init_process_group(
+                backend="nccl",
+                timeout=timedelta(hours=2),
+            )
         device = f"cuda:{_local_rank}"
         torch.cuda.set_device(_local_rank)
 
@@ -327,70 +339,30 @@ def train(
             per_class_weights=per_class_weights,
             focal_loss_gamma=focal_loss_gamma,
             autocast_dtype=autocast_dtype,
+            max_iter=max_train_iter_per_epoch,
         )
 
-        if _is_main and val_dataset is not None:
-            if epoch_nr >= start_eval_epoch_nr:
-                model.eval()
-                if eval_metric == "loss":
-                    eval_loss = _get_eval_loss(
-                        model,
-                        labels_enum=labels_enum,
-                        data_loader=eval_data_loader,
-                        foreground_weight=foreground_weight,
-                        device=device,
-                        per_class_weights=per_class_weights,
-                        epoch_nr=epoch_nr,
-                        summary_writer=summary_writer,
-                        focal_loss_gamma=focal_loss_gamma,
-                        autocast_dtype=autocast_dtype,
-                    )
-                    if eval_loss.total_loss < best_eval_metric:
-                        best_eval_metric = eval_loss.total_loss
-                        if save_as:
-                            torch.save(raw_model.state_dict(), save_as)
-
-                    summary_writer.add_scalar(
-                        "eval/total_loss", eval_loss.total_loss, epoch_nr
-                    )
-
-                    summary_writer.add_scalar(
-                        "eval/ce_labels_loss", eval_loss.ce_labels_loss, epoch_nr
-                    )
-
-                    summary_writer.add_scalar(
-                        "eval/mse_displacement_loss",
-                        eval_loss.mse_displacement_loss,
-                        epoch_nr,
-                    )
-                elif eval_metric == "map":
-                    maps, map_mine = evaluator.eval(batch_size=val_batch_size)
-                    if map_mine > best_eval_metric:
-                        best_eval_metric = map_mine
-                        if save_as:
-                            torch.save(raw_model.state_dict(), save_as)
-
-                    summary_writer.add_scalar(
-                        "eval/map_mine",
-                        map_mine,
-                        epoch_nr,
-                    )
-
-                    if maps.get("mAP") is not None:
-                        summary_writer.add_scalar(
-                            "eval/map_soccernet",
-                            maps["mAP"],
-                            epoch_nr,
-                        )
-                elif eval_metric == "competition_score":
-                    comp = _eval_competition_score(
-                        evaluator=evaluator,
-                        labels_enum=labels_enum,
-                        val_batch_size=val_batch_size,
-                        snms_window=comp_score_snms_window,
-                        threshold=comp_score_threshold,
-                        epoch_nr=epoch_nr,
-                    )
+        # Eval orchestration:
+        #  - competition_score runs on ALL ranks (videos are sharded across
+        #    ranks; results are gathered inside _eval_competition_score). This
+        #    is critical: with single-rank eval, ranks 1+ block on the next
+        #    train allreduce and NCCL times out.
+        #  - loss and map eval still run rank-0-only (legacy paths). All ranks
+        #    must still flip model.eval()/model.train() symmetrically and the
+        #    non-main ranks idle through the eval block; for these paths this
+        #    relies on the bumped 2-hour NCCL timeout we set at init.
+        if val_dataset is not None and epoch_nr >= start_eval_epoch_nr:
+            model.eval()
+            if eval_metric == "competition_score":
+                comp = _eval_competition_score(
+                    evaluator=evaluator,
+                    labels_enum=labels_enum,
+                    val_batch_size=val_batch_size,
+                    snms_window=comp_score_snms_window,
+                    threshold=comp_score_threshold,
+                    epoch_nr=epoch_nr,
+                )
+                if _is_main:
                     if comp["avg_final_score"] > best_eval_metric:
                         best_eval_metric = comp["avg_final_score"]
                         if save_as:
@@ -417,8 +389,66 @@ def train(
                             pc.get("fp_penalty", 0.0),
                             epoch_nr,
                         )
+            elif _is_main:
+                if eval_metric == "loss":
+                    eval_loss = _get_eval_loss(
+                        model,
+                        labels_enum=labels_enum,
+                        data_loader=eval_data_loader,
+                        foreground_weight=foreground_weight,
+                        device=device,
+                        per_class_weights=per_class_weights,
+                        epoch_nr=epoch_nr,
+                        summary_writer=summary_writer,
+                        focal_loss_gamma=focal_loss_gamma,
+                        autocast_dtype=autocast_dtype,
+                    )
+                    if eval_loss.total_loss < best_eval_metric:
+                        best_eval_metric = eval_loss.total_loss
+                        if save_as:
+                            torch.save(raw_model.state_dict(), save_as)
 
-                model.train()
+                    summary_writer.add_scalar(
+                        "eval/total_loss", eval_loss.total_loss, epoch_nr
+                    )
+                    summary_writer.add_scalar(
+                        "eval/ce_labels_loss", eval_loss.ce_labels_loss, epoch_nr
+                    )
+                    summary_writer.add_scalar(
+                        "eval/mse_displacement_loss",
+                        eval_loss.mse_displacement_loss,
+                        epoch_nr,
+                    )
+                elif eval_metric == "map":
+                    maps, map_mine = evaluator.eval(batch_size=val_batch_size)
+                    if map_mine > best_eval_metric:
+                        best_eval_metric = map_mine
+                        if save_as:
+                            torch.save(raw_model.state_dict(), save_as)
+
+                    summary_writer.add_scalar(
+                        "eval/map_mine",
+                        map_mine,
+                        epoch_nr,
+                    )
+
+                    if maps.get("mAP") is not None:
+                        summary_writer.add_scalar(
+                            "eval/map_soccernet",
+                            maps["mAP"],
+                            epoch_nr,
+                        )
+
+            # All ranks must symmetrically return to train mode before the
+            # next training epoch starts (otherwise BN/Dropout state diverges
+            # across ranks).
+            model.train()
+
+            # Sync barrier so any straggler-rank doesn't immediately race into
+            # the next train iteration's allreduce while the others are still
+            # in eval. Cheap insurance even after the eval sharding fix.
+            if _is_ddp:
+                dist.barrier()
 
         if _is_main and save_as and save_every_epoch:
             epoch_path = f"{save_as}.epoch_{epoch_nr}.pt"
@@ -479,6 +509,7 @@ def _go_through_epoch_train(
     per_class_weights=None,
     focal_loss_gamma: float = 0.0,
     autocast_dtype: torch.dtype = torch.float16,
+    max_iter: Optional[int] = None,
 ):
     return _go_through_epoch(
         model=model,
@@ -488,6 +519,7 @@ def _go_through_epoch_train(
         scheduler=scheduler,
         scaler=scaler,
         optimizer=optimizer,
+        max_iter=max_iter,
         acc_grad_iter=acc_grad_iter,
         epoch_nr=epoch_nr,
         foreground_weight=foreground_weight,
@@ -549,6 +581,7 @@ def _go_through_epoch(
     per_class_weights=None,
     focal_loss_gamma: float = 0.0,
     autocast_dtype: torch.dtype = torch.float16,
+    max_iter: Optional[int] = None,
 ):
     loss_weights = loss_weights or [1.5, 1]
     if not evaluate:
@@ -680,6 +713,16 @@ def _go_through_epoch(
                     backward_only=(batch_idx + 1) % acc_grad_iter != 0,
                 )
             batch_idx += 1
+            # Smoke-test break: cap an epoch to N iterations so eval can be
+            # reached quickly. Used to verify multi-rank eval without waiting
+            # 1.5h for a full epoch.
+            if max_iter is not None and batch_idx >= max_iter:
+                if is_main:
+                    print(
+                        f"[smoke-test] early break at iter {batch_idx} "
+                        f"(max_iter={max_iter})"
+                    )
+                break
 
     ce_per_class = {}
     for c in range(n_classes):
@@ -738,19 +781,29 @@ def _eval_competition_score(
     then score each video against its Labels-ball.json ground truth and return the
     aggregate competition score.
 
+    Under DDP, each rank handles a disjoint subset of videos. Per-video results
+    are gathered to all ranks, and rank 0 produces the final aggregate prints.
+
     Returns dict with: avg_final_score, avg_raw_score, per_class {matched_points, fp_penalty}.
     """
     import numpy as np
 
+    is_ddp = dist.is_available() and dist.is_initialized()
+    rank = dist.get_rank() if is_ddp else 0
+    world_size = dist.get_world_size() if is_ddp else 1
+
+    # Each rank only runs inference on its sharded subset of videos.
     scored_videos = evaluator.get_scored_videos(
         batch_size=val_batch_size,
         use_snms=False,
         use_hflip=False,
         snms_params=None,
+        rank=rank,
+        world_size=world_size,
     )
 
     class_list = list(labels_enum)
-    per_video_results = []
+    per_video_results: list = []
     per_class_agg: dict = {}
 
     for vd in scored_videos:
@@ -789,8 +842,32 @@ def _eval_competition_score(
             for k in ("matched_points", "fp_penalty", "n_matched", "n_fp", "n_gt"):
                 agg[k] += pc.get(k, 0)
 
+    # Gather per-rank results onto every rank, then rebuild the global aggregate.
+    # We use all_gather_object so plain Python objects (results, dicts) can be
+    # transmitted without manual tensor-encoding. This is fine for ~tens of
+    # videos per epoch; cost is ~milliseconds.
+    if is_ddp and world_size > 1:
+        gathered_per_video: list = [None] * world_size
+        gathered_per_class: list = [None] * world_size
+        dist.all_gather_object(gathered_per_video, per_video_results)
+        dist.all_gather_object(gathered_per_class, per_class_agg)
+
+        # Flatten per-video lists in rank order so video order is deterministic.
+        per_video_results = [r for rank_list in gathered_per_video for r in rank_list]
+
+        # Combine per-class dicts by summing across ranks.
+        merged_per_class: dict = {}
+        for d in gathered_per_class:
+            for cls_name, pc in d.items():
+                agg = merged_per_class.setdefault(
+                    cls_name, {"matched_points": 0.0, "fp_penalty": 0.0, "n_matched": 0, "n_fp": 0, "n_gt": 0}
+                )
+                for k in ("matched_points", "fp_penalty", "n_matched", "n_fp", "n_gt"):
+                    agg[k] += pc.get(k, 0)
+        per_class_agg = merged_per_class
+
     agg_final = aggregate_final_scores(per_video_results)
-    if epoch_nr is not None:
+    if epoch_nr is not None and rank == 0:
         print(
             f"[eval epoch {epoch_nr}] competition_score "
             f"(snms_window={snms_window}, threshold={threshold:.2f}): "

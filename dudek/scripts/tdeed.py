@@ -670,6 +670,12 @@ def create_solution(
     default=0,
     help="Number of epochs to freeze backbone + SGP at the start of training. Lets the randomly-initialised sequence decoder settle before its gradients flow back into the BAS-pretrained weights. 0 disables the warm-start (rely on LR warmup only). Typical: 2-3 with use_seq_decoder=True.",
 )
+@click.option(
+    "--max_train_iter_per_epoch",
+    type=int,
+    default=None,
+    help="SMOKE TEST: cap each train epoch to N iterations and break early. Use to verify multi-rank eval/checkpoint flow without waiting for a full epoch. Combine with --start_eval_epoch_nr=0 to trigger eval after N iters. Leave unset for normal training.",
+)
 def train_competition(
     dataset_path: str,
     resolution: int = 224,
@@ -722,6 +728,7 @@ def train_competition(
     seq_decoder_dropout: float = 0.1,
     use_bf16: bool = False,
     seq_freeze_epochs: int = 0,
+    max_train_iter_per_epoch: int = None,
 ):
     assert resolution in [224, 720]
     assert eval_metric in ["loss", "map", "competition_score"], (
@@ -859,6 +866,7 @@ def train_competition(
         comp_score_threshold=comp_score_threshold,
         use_bf16=use_bf16,
         seq_freeze_epochs=seq_freeze_epochs,
+        max_train_iter_per_epoch=max_train_iter_per_epoch,
     )
 
 

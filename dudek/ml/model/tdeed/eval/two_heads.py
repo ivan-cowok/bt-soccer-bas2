@@ -160,11 +160,18 @@ class BASTeamTDeedEvaluator(TDeedMAPEvaluator):
         use_snms: Optional[bool] = False,
         use_hflip: bool = False,
         snms_params: Optional[dict] = None,
+        rank: int = 0,
+        world_size: int = 1,
     ):
+        # Optional video sharding for DDP eval: rank R of W processes only
+        # videos with idx % W == R. Each rank thus handles ~N/W videos in
+        # parallel. Defaults preserve original single-process behavior.
         video_dataset_map = self.dataset.group_by_videos()
         flipped_scores = None
         scored_videos: List[_TeamBASScoredVideo] = []
-        for video, clips_dataset in video_dataset_map.items():
+        for video_idx, (video, clips_dataset) in enumerate(video_dataset_map.items()):
+            if world_size > 1 and (video_idx % world_size) != rank:
+                continue
             video_predictions = []
             bas_predictions_flipped = []
             clips_loader = DataLoader(
