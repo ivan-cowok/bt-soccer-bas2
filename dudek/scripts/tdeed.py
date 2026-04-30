@@ -7,7 +7,6 @@ from typing import List, Tuple, Type
 
 import numpy as np
 import torch
-import wandb
 from tqdm import tqdm
 
 from dudek.config import (
@@ -142,6 +141,7 @@ def pretrain(
     assert resolution in [224, 720]
 
     if use_wandb:
+        import wandb
         wandb.init(project=experiment_name, sync_tensorboard=True)
 
     videos = load_action_spotting_videos(
@@ -291,6 +291,7 @@ def train(
 ):
     assert resolution in [224, 720]
     if use_wandb:
+        import wandb
         wandb.init(project=experiment_name, sync_tensorboard=True)
 
 
@@ -426,6 +427,7 @@ def train_challenge(
 ):
     assert resolution in [224, 720]
     if use_wandb:
+        import wandb
         wandb.init(project=experiment_name, sync_tensorboard=True)
 
     videos = load_bas_videos(dataset_path, resolution=resolution)
@@ -730,6 +732,7 @@ def train_competition(
             "eval_metric=competition_score requires --val_dataset_path (Labels-ball.json GT)."
         )
     if use_wandb:
+        import wandb
         wandb.init(project=experiment_name, sync_tensorboard=True)
 
     videos = load_competition_videos(dataset_path, resolution=resolution, labels_enum=Action)
